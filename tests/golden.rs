@@ -4,7 +4,10 @@
 //! manifest is generated from the container's own header, so these tests are the
 //! place where "the file and the code describe the same model" is asserted.
 
-use qwen35::weights::{self, manifest};
+use qwen35::ops;
+use qwen35::weights::{self, manifest, Data};
+
+mod common;
 
 fn spec(name: &str) -> &'static manifest::TensorSpec {
     weights::spec(name).unwrap_or_else(|| panic!("the container has no tensor {name:?}"))
@@ -190,4 +193,130 @@ fn tensor_count_adds_up_block_by_block() {
     assert_eq!(text, 320);
     assert_eq!(vision, 153);
     assert_eq!(text + vision, manifest::MODEL_TENSOR_COUNT);
+}
+
+#[test]
+fn the_digest_helper_is_zlib_compatible() {
+    assert_eq!(common::crc32(b"123456789"), 0xCBF4_3926);
+    assert_eq!(common::crc32(b""), 0);
+}
+
+/// The reference dequantisation, as `zlib.crc32` over the little-endian `f32`
+/// values, produced by `dev/dump_dequant.py` from `quantlib.read_tensor`.
+///
+/// Two of these are quantised and one is dense, so a wrong nibble order, a wrong
+/// group boundary, a wrong scale or a wrong `bf16` shift each move a number here.
+#[test]
+fn dequantisation_matches_the_reference_digests() {
+    struct Case {
+        name: &'static str,
+        digest: u32,
+        head: [f32; 4],
+        tail: [f32; 4],
+    }
+    let cases = [
+        Case {
+            name: "model.language_model.layers.11.self_attn.k_proj.weight",
+            digest: 0x9c27_fcd7,
+            head: [0.0159072876, 0.0, 0.026512146, 0.0053024292],
+            tail: [0.0, 0.0238494873, -0.0298118591, 0.00596237183],
+        },
+        Case {
+            name: "model.language_model.layers.0.input_layernorm.weight",
+            digest: 0x840f_3fb1,
+            head: [1.0, 0.294921875, 0.53515625, 0.74609375],
+            tail: [0.15625, 0.209960938, 0.240234375, 0.17578125],
+        },
+        Case {
+            name: "model.language_model.layers.0.linear_attn.A_log",
+            digest: 0xda1b_9105,
+            head: [0.2578125, -2.03125, -2.125, -0.56640625],
+            tail: [-1.6484375, -1.453125, -1.8984375, -2.609375],
+        },
+    ];
+    for case in cases {
+        let tensor = weights::expect(case.name);
+        let values = tensor.values();
+        assert_eq!(values.len(), tensor.numel(), "{}", case.name);
+        assert_eq!(
+            common::crc32(&common::f32_le_bytes(&values)),
+            case.digest,
+            "{}: values differ from the reference",
+            case.name
+        );
+        assert_eq!(&values[..4], &case.head, "{}: head", case.name);
+        assert_eq!(&values[values.len() - 4..], &case.tail, "{}: tail", case.name);
+    }
+}
+
+/// The vector path must not change a single bit.
+///
+/// Every value is one multiply of an exact integer by an `f32`, so the two paths
+/// have nothing to disagree about; a difference would mean the nibble order,
+/// the interleaving or the tail handling is wrong.
+#[test]
+fn the_vector_path_and_the_portable_path_agree_bit_for_bit() {
+    let names = [
+        "model.language_model.layers.11.self_attn.k_proj.weight",
+        "model.language_model.layers.0.mlp.down_proj.weight",
+        "model.visual.merger.linear_fc2.weight",
+        "model.visual.pos_embed.weight",
+        "mtp.fc.weight",
+    ];
+    for name in names {
+        let tensor = weights::expect(name);
+        let Data::Quantized {
+            scales,
+            integers,
+            bits,
+        } = tensor.data
+        else {
+            panic!("{name} should be quantised");
+        };
+        let mut fast = vec![0.0f32; tensor.numel()];
+        let mut slow = vec![0.0f32; tensor.numel()];
+        ops::dequantize(bits, tensor.spec.group, scales, integers, &mut fast);
+        ops::dequantize_scalar(bits, tensor.spec.group, scales, integers, &mut slow);
+        assert!(
+            fast.iter()
+                .zip(&slow)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{name}: the two paths disagree"
+        );
+        assert_eq!(fast, tensor.values(), "{name}: values() takes another path");
+    }
+}
+
+/// A dequantised weight must be an integer multiple of its group's scale.
+///
+/// This is the property the format promises, checked against the values the
+/// kernel produced rather than against the bytes it read: dividing back has to
+/// land on a whole number in `[-2^(bits-1), 2^(bits-1)-1]`.
+#[test]
+fn every_dequantised_value_is_an_integer_multiple_of_its_scale() {
+    let name = "model.language_model.layers.11.self_attn.k_proj.weight";
+    let tensor = weights::expect(name);
+    let Data::Quantized { scales, .. } = tensor.data else {
+        panic!("{name} should be quantised");
+    };
+    let values = tensor.values();
+    let group = tensor.spec.group;
+    let highest = (1i32 << (4 - 1)) - 1;
+    for (index, value) in values.iter().enumerate() {
+        let scale = ops::f16_to_f32(u16::from_le_bytes([
+            scales[2 * (index / group)],
+            scales[2 * (index / group) + 1],
+        ]));
+        assert!(scale > 0.0, "{name}: scale {scale} at group {}", index / group);
+        let integer = value / scale;
+        let rounded = integer.round();
+        assert!(
+            (integer - rounded).abs() <= 1e-3,
+            "{name}[{index}]: {value} is not a multiple of {scale}"
+        );
+        assert!(
+            (-(highest + 1)..=highest).contains(&(rounded as i32)),
+            "{name}[{index}]: {rounded} is outside the 4-bit range"
+        );
+    }
 }

@@ -14,7 +14,7 @@ GPU 后端在后面的里程碑里以 feature 引入。
 | # | 交付 | 状态 | 判据 / 读数 |
 |---|---|---|---|
 | M0 | `dev/gen_manifest.py` + 嵌入 + 编译期校验 | **已交付** | 常量全过 `const` assert；张量数 488（模型 473 + MTP 15）；首 4 字节 `"QWQT"`；`model_info.exe` = 495,116,800 B |
-| M1 | int4/int8 反量化 | 待做 | 与 Python `read_tensor` 逐位一致，`max_abs_diff = 0.0` |
+| M1 | int4/int8 反量化 | **已交付** | 488/488 张量、873,438,784 个值与参考 `read_tensor` 的 CRC-32 相同；6 个整张量逐元素 `max\|d\| = 0.0` |
 | M2 | tokenizer | 待做 | 与参考 tokenizer 的 ids 完全相等（含模板渲染） |
 | M3 | 文本单层（`linear_attention` 与 `full_attention` 各一） | 待做 | 每层 5 个检查点对拍（定义见规格 §13） |
 | M4 | 24 层 + final norm + 输出头 | 待做 | 逐层 residual 对拍；logits top-1 与参考一致 |
@@ -44,7 +44,6 @@ cargo build
 cargo test
 cargo run --release --example model_info
 ```
-
 默认构建没有依赖。对拍参考实现的层需要 dump，它们不在仓库里：
 
 ```

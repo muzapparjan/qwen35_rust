@@ -95,11 +95,28 @@ impl Tensor {
         &blob()[self.spec.offset..self.spec.offset + self.spec.length]
     }
 
-    /// The dense values as `f32`, converting from `bf16` or `f16` when needed.
+    /// All of the tensor's values as `f32`, in row-major order.
     ///
-    /// Panics for a quantised tensor: those are read as group indices by the
-    /// kernels and are never expanded into a whole `f32` tensor.
-    pub fn to_f32(&self) -> Vec<f32> {
+    /// Quantised tensors are expanded through [`crate::ops::dequantize`]; dense
+    /// ones are converted from `bf16`/`f16`. This is for tests and for the few
+    /// dense helper tensors: the matrix kernels read the packed integers in
+    /// place, because expanding a whole weight table costs gigabytes.
+    pub fn values(&self) -> Vec<f32> {
+        match self.data {
+            Data::Quantized {
+                scales,
+                integers,
+                bits,
+            } => {
+                let mut out = vec![0.0f32; self.numel()];
+                crate::ops::dequantize(bits, self.spec.group, scales, integers, &mut out);
+                out
+            }
+            _ => self.dense_values(),
+        }
+    }
+
+    fn dense_values(&self) -> Vec<f32> {
         match self.data {
             Data::F32(bytes) => bytes
                 .chunks_exact(4)
@@ -114,7 +131,7 @@ impl Tensor {
                     .collect(),
                 _ => bytes
                     .chunks_exact(2)
-                    .map(|chunk| f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                    .map(|chunk| crate::ops::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
                     .collect(),
             },
             Data::Quantized { .. } => {
@@ -183,36 +200,6 @@ fn data_of(spec: &'static TensorSpec) -> Data {
             }
         }
     }
-}
-
-/// IEEE 754 binary16 to binary32.
-///
-/// The container's own scale values are f16; no dense tensor in this checkpoint
-/// uses the format, but a container is allowed to.
-fn f16_to_f32(half: u16) -> f32 {
-    let sign = (u32::from(half) & 0x8000) << 16;
-    let exponent = (half >> 10) & 0x1f;
-    let mantissa = u32::from(half & 0x03ff);
-    let bits = if exponent == 0 {
-        if mantissa == 0 {
-            sign
-        } else {
-            // Subnormal: renormalise by shifting until the implicit bit appears.
-            let mut exponent: i32 = 127 - 15 + 1;
-            let mut mantissa = mantissa;
-            while mantissa & 0x0400 == 0 {
-                mantissa <<= 1;
-                exponent -= 1;
-            }
-            sign | ((exponent as u32) << 23) | ((mantissa & 0x03ff) << 13)
-        }
-    } else if exponent == 0x1f {
-        // Infinity and NaN keep their payload; quiet NaN stays quiet.
-        sign | 0x7f80_0000 | (mantissa << 13)
-    } else {
-        sign | ((u32::from(exponent) + 127 - 15) << 23) | (mantissa << 13)
-    };
-    f32::from_bits(bits)
 }
 
 #[cfg(test)]
@@ -299,7 +286,7 @@ mod tests {
         let tensor = expect("model.language_model.layers.0.linear_attn.A_log");
         assert_eq!(tensor.numel(), manifest::LINEAR_VALUE_HEADS);
         assert!(matches!(tensor.data, Data::F32(_)), "A_log should be f32");
-        let values = tensor.to_f32();
+        let values = tensor.values();
         assert_eq!(values.len(), manifest::LINEAR_VALUE_HEADS);
         for value in values {
             assert!(value.is_finite(), "A_log holds {value}");
@@ -313,35 +300,13 @@ mod tests {
         // vector of trained values, so a wrong shift would show up immediately.
         let tensor = expect("model.language_model.layers.0.input_layernorm.weight");
         assert_eq!(tensor.spec.kind, "bf16");
-        let values = tensor.to_f32();
+        let values = tensor.values();
         assert_eq!(values.len(), manifest::HIDDEN_SIZE);
         assert!(values.iter().all(|value| value.is_finite()));
         assert!(values.iter().any(|value| *value != 0.0));
         // bf16 keeps the top 16 bits, so the value round-trips through f32.
         for value in &values {
             assert_eq!(f32::from_bits(value.to_bits() & 0xffff_0000), *value);
-        }
-    }
-
-    #[test]
-    fn f16_decoding_matches_known_values() {
-        let cases: [(u16, f32); 8] = [
-            (0x0000, 0.0),
-            (0x8000, -0.0),
-            (0x3c00, 1.0),
-            (0xc000, -2.0),
-            (0x7bff, 65504.0),
-            (0x0001, 5.960_464_5e-8),
-            (0x7c00, f32::INFINITY),
-            (0x7e00, f32::NAN),
-        ];
-        for (bits, expected) in cases {
-            let value = f16_to_f32(bits);
-            if expected.is_nan() {
-                assert!(value.is_nan(), "{bits:#06x}");
-            } else {
-                assert_eq!(value.to_bits(), expected.to_bits(), "{bits:#06x}");
-            }
         }
     }
 
