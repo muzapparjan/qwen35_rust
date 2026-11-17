@@ -1,0 +1,14 @@
+qwen35-rust
+
+This crate reimplements inference for the Qwen3.5-0.8B model in Rust. It does not
+include or modify the model's source code; it embeds a quantised copy of the
+published weights and reads two files of the release (the tokenizer and the chat
+template) to build its own reader.
+
+The model weights, configuration, tokenizer and chat template are Apache-2.0
+licensed work of the Qwen team (Alibaba). The operator-level reading was taken
+from the Hugging Face Transformers implementation, which is also Apache-2.0.
+
+Every file this build derives from is listed in THIRD-PARTY.md with its byte
+length and SHA256. Those hashes are the identity of the inputs: the local
+snapshot does not carry the upstream commit id.

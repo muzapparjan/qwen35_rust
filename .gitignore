@@ -1,0 +1,5 @@
+/target
+/tmp
+/dev
+# A library: the resolver is the consumer's choice.
+/Cargo.lock

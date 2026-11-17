@@ -1,0 +1,22 @@
+[package]
+name = "qwen35-rust"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Qwen3.5-0.8B inference in Rust, CPU (std only) and wgpu backends"
+readme = "README.md"
+
+[lib]
+name = "qwen35"
+
+[features]
+default = []
+# Disable the vector kernels so the portable path can be timed end to end.
+force-scalar = []
+# Compare against tensors dumped from the reference implementation. The dumps
+# are not part of the repository, so this is off by default: a checkout runs the
+# tests that stand on their own.
+reference-fixtures = []
+
+[dependencies]
