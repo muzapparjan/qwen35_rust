@@ -10,4 +10,5 @@
 
 pub mod cpu;
 pub mod ops;
+pub mod tokenizer;
 pub mod weights;

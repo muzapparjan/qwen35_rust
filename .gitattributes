@@ -1,3 +1,7 @@
 # The weights container is a binary file addressed byte for byte by the
 # manifest. A line-ending conversion would change every byte, so it is pinned.
 *.qwqt -text -diff
+
+# The tokenizer tables are the same kind of file: u32 arrays and raw token
+# bytes, addressed by offsets.
+*.bin -text -diff
