@@ -18,11 +18,11 @@ GPU 后端在后面的里程碑里以 feature 引入。
 | M2 | tokenizer | **已交付** | 语料 56/56 的 pieces 与 ids 与参考完全相等；chat template 8/8；NFC 与字符类逐码点对过参考 |
 | M3 | 文本单层（`linear_attention` 与 `full_attention` 各一） | **已交付** | 层 0 与层 3 的 5 个检查点全过，最大相对误差 3.7e-6 |
 | M4 | 24 层 + final norm + 输出头 | **已交付** | 24 层逐层 residual 对拍（3 个用例），logits top-1 全中 |
-| M5 | prefill / decode cache 一致性 | **已交付** | 同一条代码路径，`max\|d\| = 0.0` |
+| M5 | prefill / decode cache 一致性 | **已交付** | 两条路径（批量分块内核与单 token 融合内核）相对差 4.0e-7，top-1 相同；批量内任意切分逐位相同 |
 | M6 | 视觉塔 + 图像输入 | 待做 | `patch_embed` → 12 层 → `merger` 逐点对拍 |
 | M7 | MTP 头 | 待做 | 与自建 dump 对拍（PyTorch 主类不加载它） |
 | M8 | wgpu 后端 | 待做 | 与 CPU 后端同算术路径结果一致（`--features wgpu`） |
-| M9 | 性能 | 待做：decode 0.39 s/token、prefill 3.6 tok/s（可移植内核） | 超过 PyTorch eager 基线 |
+| M9 | 性能 | **进行中**：decode 0.028 s/token（基线 0.089，快 3.2 倍）；prefill 0.48 s ＝ 170 tok/s（基线 0.323 s ＝ 250） | 超过 PyTorch eager 基线（同一时间窗内交替测量；这台机器有常驻负载，不同窗口的绝对值不可比） |
 
 每个数字的出处（命令与日期）在 [`dev/README.md`](dev/README.md)：那里只写实测
 读数与未采用的方案，不写代码。
@@ -36,6 +36,7 @@ src/weights/mod.rs    嵌入的容器、张量查找、dense 张量的 f32 视�
 src/weights/manifest.rs  @generated：488 个张量的名字/形状/偏移 + 架构常量
 src/weights/qwen3.5-0.8b-q4.qwqt  嵌入的权重（495 MB，-text）
 src/ops.rs            数值内核：反量化、f32 读行、线性层、RMSNorm、softmax、RoPE
+src/parallel.rs       fork-join worker 池（std only）
 src/cpu.rs            指令集探测与 `force-scalar` 开关
 src/model/mod.rs      24 层、两种 token mixer、KV 与递推缓存
 src/tokenizer/        byte-level BPE、NFC、预分词（unicode.rs / split.rs）
@@ -49,6 +50,7 @@ tests/text.rs         逐层与 logits 对拍、缓存一致性
 examples/model_info.rs 打印容器内容，并校验真实字节
 examples/tokenize.rs   渲染 prompt、编码、解码回来
 examples/say_text.rs   端到端贪心生成
+examples/bench.rs      prefill 与 decode 的计时（预热 + 中位数）
 ```
 
 ## 构建与测试

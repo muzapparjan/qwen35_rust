@@ -197,9 +197,12 @@ fn tracing_does_not_change_the_answer() {
 
 /// One call for the whole prompt and one call per token must agree.
 ///
-/// They go through the same cached state, so the difference is exactly zero
-/// here; the reference's own two paths differ by 6.3e-7 because its prefill uses
-/// the chunked form of the delta rule.
+/// The two shapes run different kernels: a batch expands a slab of a weight row
+/// once and reuses it for every token, while a single token unpacks straight
+/// into the products. Their sums therefore associate differently, which is worth
+/// about 1e-7 relative; the gate is on that size. What it catches is a cache
+/// indexed or strided wrongly, which moves the difference to the order of a
+/// percent.
 #[test]
 fn prefill_and_decode_agree() {
     let ids = read_ids("mixed");
@@ -218,7 +221,7 @@ fn prefill_and_decode_agree() {
 
     let (worst, relative) = metrics(&whole, &stepped);
     println!("prefill against decode: max|d| {worst:.3e}  rel {relative:.3e}");
-    assert_eq!(worst, 0.0, "the two paths are the same code");
+    assert!(relative < 1e-6, "the two paths diverge: rel {relative:.3e}");
     assert_eq!(top(&whole), top(&stepped));
 }
 

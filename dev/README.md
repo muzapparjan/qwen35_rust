@@ -247,7 +247,87 @@ dump 用**反量化后的 q4 权重**跑参考（`read_tensor` 把 473 个参数
   token 约 600 KB 临时量。看起来该缓存，但它们合计 2.4M 参数，而热点是 871M 个 q4 值；
   先优化后者。
 
+## M9：性能（2026-11-18）
+
+```
+cargo run --release --example bench -- --tokens 8
+D:/Projects/Models/Qwen3.5-0.8B/.venv/Scripts/python.exe dev/bench_reference.py --tokens 81 --decode 8
+```
+
+两边都是 81 token 的 prompt、丢弃一次预热、取中位数。参考跑它的原生 float32 与默认线程数
+（24 个），本移植用 8 个 worker。
+
+### 先说测量本身：同一对命令，不同时间窗差 3 倍
+
+这台机器上常驻着 `QQPCTray`、`PerfTune`、`Weixin` 与两个 VS Code（各占上万 CPU 秒）。
+同一对命令在两个时间窗量到的结果：
+
+| 时间窗 | 本移植 prefill | PyTorch eager prefill |
+|---|---|---|
+| 空载 | 0.48 s ＝ 170 tok/s | 0.323 s ＝ 250 tok/s |
+| 有负载 | 0.72 s ＝ 112 tok/s | 1.37 s ＝ 59 tok/s |
+
+参考实现用的是 torch 的 24 个线程，本移植用 8 个，所以负载对它的打击更大。**结论只能写成
+「两个窗口里互有胜负」，不能写成一个比值**；下表只记录各自窗口内的数，并注明窗口。
+
+| 读数 | 本移植 | PyTorch eager（f32 / 24 线程） |
+|---|---|---|
+| prefill 81 token（空载） | 0.48 s ＝ 170 tok/s | 0.323 s ＝ 250 tok/s |
+| decode（空载） | 0.028 s/token ＝ 36 tok/s | 0.089 s/token ＝ 11 tok/s |
+| prefill（有负载） | 0.72 s ＝ 112 tok/s | 1.37 s ＝ 59 tok/s |
+| decode（有负载） | 0.039 s/token ＝ 26 tok/s | 0.281 s/token ＝ 3.6 tok/s |
+
+decode 在两个窗口都比基线快 3 倍以上；prefill 在空载窗口仍落后约 1.5 倍。
+
+### 最大的单项不是内核，是递推里的访存顺序
+
+`linear_attention` 的 `memory = Sᵀk` 原来写成「列在外、行在内」，读
+`state[row * 128 + index]` 的步长是 128 个 float：每个输出元素都跨一条缓存行。改成行在外、
+列在内（`ops::transposed_matvec`）之后，同一段算术遍历整个 `state` 是连续的。
+**prefill 0.720 → 0.457 s，decode 0.031 → 0.027 s**，而每一层的检查点逐位不变（每个
+`out[i]` 仍然是按行号递增求和）。
+
+同批改的还有：因果卷积改成直接形式（历史窗口从缓存里拼成 4 个平面），于是 token 之间互相
+独立、可以并行；`rms_norm_gated` 按行并行。
+
+### 量化矩阵乘的三个内核
+
+1. **单 token（decode）**：`quantised_dot_avx2`，把 q4 字节直接解成乘积累加，不物化任何
+   行。物化的代价是每次前向写 871M 个 `f32`（3.5 GB），实测让 decode 从 0.031 s 变成
+   0.078 s —— 单 token 没有第二个 token 来分摊这次展开。
+2. **批量（prefill）**：`panel_rows`，一次展开 128 列（4 个量化组）到 L1，然后**一次调用
+   覆盖整个 token 轴**。原来每个 token 单独调用一次 `dot`，128 个值的点积要付一次调用开销
+   （序言、`vzeroupper`、指令集探测），那笔开销是工作量的三倍。
+3. **行分块**：四个输出行共用同一批输入向量（`accumulate_slab_quad`），或两个行
+   （`accumulate_slab_pair`）。实测 2 行 × 4 token 与 4 行 × 2 token 在模型上分别是
+   0.693 / 0.720 s，取前者。
+
+用真权重、长计时（每组 0.25 s、取 5 次最好值）量到的内核速率：`in_proj_qkv`
+143–185、`gate_proj` 149–187、`down_proj` 215–250、`q_proj` 99–147 GMAC/s（区间是我的
+多次运行之间的散布，不是同一次测量的置信区间）。
+
+### 一个我自己搞错的探针
+
+我先写了一个「纯乘加上限」探针：`for _ in 0..n { total += dot(&a, &b) }`，两个操作数在
+循环里不变 —— 这整段被优化器外提了，量出的 27 / 144 / 205 GMAC/s 是假的。把两个切片
+`black_box` 之后再量：**每个 worker 30 GMAC/s，8 个 worker 242**（8 个 worker 线性叠加），
+正好等于「一个 fma 要两次装载」的端口上限。**所以那组数字当时就被我写进文档，是错的；
+以这一行为准。**
+
+### prefill 与 decode 的判据变了，原因写在测试里
+
+两条路径现在是两个内核（融合 vs 分块），求和次序不同，`max|d|` 从 0.0 变成 7.2e-6
+（相对 4.0e-7）。`tests/text.rs` 的门因此从 `== 0.0` 改成相对 1e-6：它要抓的是缓存索引
+或步长写错，那种缺陷会把差异推到百分之一的量级。
+
+换内核之后 M5 的判据没有退化：24 层逐层对拍 worst rel 3.7e-6（layer 13 的
+`linear_attn.norm.out`），logits top-1 仍是 3/3。
+
 ## 下一步
 
-M6：视觉塔。第一步把 `patch_embed → 12 层 → merger` 的中间量加进 dump，并把图像预处理
-（`Qwen2VLImageProcessorFast` 的 `smart_resize` 与重采样）读定。
+- **M9 剩余项：prefill 的每核效率。** 空载窗口 170 tok/s 对 250。现在 69.5 GMAC 的一次
+  prefill 有约 0.42 s 花在量化矩阵乘上，而内核读数在 150–250 GMAC/s 之间散布；再往上需要
+  改算术：把激活量化成 int8 用整数乘加（每指令 32 个乘加），代价是层对拍的差从 1e-6 抬到
+  1e-2 量级，超出现在的门，要单独论证。
+- **M6：视觉塔。** 第一步把 `patch_embed → 12 层 → merger` 的中间量加进 dump，并把图像
+  预处理（`Qwen2VLImageProcessorFast` 的 `smart_resize` 与重采样）读定。

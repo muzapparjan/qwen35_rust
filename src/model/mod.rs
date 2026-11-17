@@ -324,16 +324,59 @@ impl Model {
 
         let conv_weight = vector(layer, "linear_attn.conv1d.weight"); // [conv_dim, 1, kernel]
         let mut convolved = vec![0.0f32; sequence * conv_dim];
-        for token in 0..sequence {
-            for channel in 0..conv_dim {
-                let state = &mut cache.conv[channel * kernel..(channel + 1) * kernel];
-                state.copy_within(1.., 0);
-                state[kernel - 1] = mixed[token * conv_dim + channel];
-                let mut total = 0.0f32;
-                for tap in 0..kernel {
-                    total += state[tap] * conv_weight[channel * kernel + tap];
+        // The window of token `t` reaches back `kernel - 1` places, so the first
+        // tokens of a sequence take part of their input from the cache. Both that
+        // history and the weights are laid out tap-major here, which makes every
+        // read of a tap a contiguous run and lets the tokens be computed
+        // independently.
+        let mut history = vec![0.0f32; kernel * conv_dim];
+        for channel in 0..conv_dim {
+            for slot in 0..kernel {
+                history[slot * conv_dim + channel] = cache.conv[channel * kernel + slot];
+            }
+        }
+        let mut planes = vec![0.0f32; kernel * conv_dim];
+        for channel in 0..conv_dim {
+            for tap in 0..kernel {
+                planes[tap * conv_dim + channel] = conv_weight[channel * kernel + tap];
+            }
+        }
+        crate::parallel::pool().chunks_mut(conv_dim, &mut convolved, &|index, chunk| {
+            let token = index;
+            chunk.fill(0.0);
+            for tap in 0..kernel {
+                let back = kernel as isize - 1 - tap as isize;
+                let source: &[f32] = if token as isize >= back {
+                    let start = (token as isize - back) as usize * conv_dim;
+                    &mixed[start..start + conv_dim]
+                } else {
+                    let slot = (token as isize + tap as isize + 1) as usize;
+                    &history[slot * conv_dim..(slot + 1) * conv_dim]
+                };
+                let plane = &planes[tap * conv_dim..(tap + 1) * conv_dim];
+                for (out, (value, weight)) in chunk.iter_mut().zip(source.iter().zip(plane)) {
+                    *out += value * weight;
                 }
-                convolved[token * conv_dim + channel] = ops::silu(total);
+            }
+            for value in chunk.iter_mut() {
+                *value = ops::silu(*value);
+            }
+        });
+        // Carry the window forward: the cache keeps the last `kernel` inputs.
+        for channel in 0..conv_dim {
+            let state = &mut cache.conv[channel * kernel..(channel + 1) * kernel];
+            if sequence >= kernel {
+                for slot in 0..kernel {
+                    state[slot] = mixed[(sequence - kernel + slot) * conv_dim + channel];
+                }
+            } else {
+                let kept = kernel - sequence;
+                for slot in 0..kept {
+                    state[slot] = history[(sequence + slot) * conv_dim + channel];
+                }
+                for slot in 0..sequence {
+                    state[kept + slot] = mixed[slot * conv_dim + channel];
+                }
             }
         }
         // The reference records the convolution's output before it drops the
@@ -386,34 +429,15 @@ impl Model {
                 let decay = (-(a_log[head].exp()) * ops::softplus(a[decay_base + head] + dt_bias[head])).exp();
                 let state = &mut cache.state
                     [head * key_head_dim * value_head_dim..(head + 1) * key_head_dim * value_head_dim];
-                for slot in state.iter_mut() {
-                    *slot *= decay;
-                }
+                ops::scale_all(state, decay);
                 // memory = S^T k
-                for (index, slot) in memory.iter_mut().enumerate() {
-                    let mut total = 0.0f32;
-                    for row in 0..key_head_dim {
-                        total += state[row * value_head_dim + index] * key[row];
-                    }
-                    *slot = total;
-                }
+                ops::transposed_matvec(state, key_head_dim, value_head_dim, &key, &mut memory);
                 for index in 0..value_head_dim {
                     delta[index] = (value[index] - memory[index]) * beta;
                 }
-                for row in 0..key_head_dim {
-                    let weight = key[row];
-                    for index in 0..value_head_dim {
-                        state[row * value_head_dim + index] += weight * delta[index];
-                    }
-                }
+                ops::outer_add(state, key_head_dim, value_head_dim, &key, &delta);
                 // output = S^T q
-                for (index, slot) in memory.iter_mut().enumerate() {
-                    let mut total = 0.0f32;
-                    for row in 0..key_head_dim {
-                        total += state[row * value_head_dim + index] * query[row];
-                    }
-                    *slot = total;
-                }
+                ops::transposed_matvec(state, key_head_dim, value_head_dim, &query, &mut memory);
                 for index in 0..value_head_dim {
                     core[(token * heads + head) * value_head_dim + index] = memory[index];
                 }
