@@ -58,6 +58,10 @@ pub struct Cache {
     pub linear: Vec<LinearCache>,
     /// Tokens already processed.
     pub length: usize,
+    /// Added to the position of every token after a prompt whose positions were
+    /// not the token indices, which an image prompt is: the reference calls this
+    /// the rope delta and adds it to `past + index` for the tokens it generates.
+    pub position_delta: i64,
 }
 
 /// Key and value for one full-attention layer: one buffer per head, laid out
@@ -86,6 +90,7 @@ impl Cache {
             attention: (0..manifest::FULL_LAYERS.len()).map(|_| AttentionCache::new()).collect(),
             linear: (0..manifest::LINEAR_LAYERS.len()).map(|_| LinearCache::new()).collect(),
             length: 0,
+            position_delta: 0,
         }
     }
 
@@ -102,6 +107,7 @@ impl Cache {
             cache.state.fill(0.0);
         }
         self.length = 0;
+        self.position_delta = 0;
     }
 }
 
@@ -180,18 +186,57 @@ impl Model {
 
     /// Run `ids` after whatever is already in `cache` and return the logits of
     /// the last position.
+    ///
+    /// The positions are the token indices, shifted by whatever an earlier prompt
+    /// left in the cache. [`crate::multimodal`] builds a different set for a
+    /// prompt that carries an image.
     pub fn forward<T: Trace>(&self, ids: &[u32], cache: &mut Cache, trace: &mut T) -> Vec<f32> {
         let sequence = ids.len();
         assert!(sequence > 0, "forward needs at least one token");
+        let base = cache.length as i64 + cache.position_delta;
+        let positions: Vec<[u32; 3]> = (0..sequence)
+            .map(|token| {
+                let position = (base + token as i64).max(0) as u32;
+                [position; 3]
+            })
+            .collect();
         let hidden = manifest::HIDDEN_SIZE;
-        let eps = manifest::RMS_NORM_EPS;
-
-        // --- embeddings
         let embed = embedding_matrix();
         let mut x = vec![0.0f32; sequence * hidden];
         for (token, id) in ids.iter().enumerate() {
             ops::row_values(&embed, *id as usize, &mut x[token * hidden..(token + 1) * hidden]);
         }
+        self.forward_hidden(x, sequence, &positions, cache, trace)
+    }
+
+    /// Run rows that have already been embedded, with explicit positions.
+    ///
+    /// One position row per token, three indices each (temporal, height, width);
+    /// text has the same index in all three. This is the entry point a prompt
+    /// with an image uses, because the image spans carry their own grid.
+    pub fn forward_embeds<T: Trace>(
+        &self,
+        embeds: &[f32],
+        sequence: usize,
+        positions: &[[u32; 3]],
+        cache: &mut Cache,
+        trace: &mut T,
+    ) -> Vec<f32> {
+        assert_eq!(embeds.len(), sequence * manifest::HIDDEN_SIZE, "embedding rows");
+        assert_eq!(positions.len(), sequence, "one position per token");
+        self.forward_hidden(embeds.to_vec(), sequence, positions, cache, trace)
+    }
+
+    fn forward_hidden<T: Trace>(
+        &self,
+        mut x: Vec<f32>,
+        sequence: usize,
+        positions: &[[u32; 3]],
+        cache: &mut Cache,
+        trace: &mut T,
+    ) -> Vec<f32> {
+        let hidden = manifest::HIDDEN_SIZE;
+        let eps = manifest::RMS_NORM_EPS;
         record!(trace, &[sequence, hidden], &x, "embed");
 
         // --- layers
@@ -223,6 +268,7 @@ impl Model {
                     &normalized,
                     sequence,
                     cache.length,
+                    positions,
                     trace,
                     &mut mixed,
                 );
@@ -270,6 +316,7 @@ impl Model {
         record!(trace, &[sequence, hidden], &final_hidden, "final_norm.out");
 
         let mut logits = vec![0.0f32; manifest::VOCAB_SIZE];
+        let embed = embedding_matrix();
         ops::linear(
             &final_hidden[(sequence - 1) * hidden..],
             1,
@@ -510,6 +557,7 @@ impl Model {
         x: &[f32],
         sequence: usize,
         past: usize,
+        positions: &[[u32; 3]],
         trace: &mut T,
         out: &mut [f32],
     ) {
@@ -578,7 +626,7 @@ impl Model {
         ops::linear(x, sequence, &matrix(layer, "self_attn.v_proj.weight"), None, &mut value);
 
         // --- rotation
-        let (cos, sin) = rope_tables(past, sequence);
+        let (cos, sin) = rope_tables(&positions[..sequence]);
         for token in 0..sequence {
             for head in 0..heads {
                 let base = (token * heads + head) * head_dim;
@@ -651,12 +699,18 @@ impl Model {
     }
 }
 
-/// `cos`/`sin` for `sequence` positions starting at `past`, 32 values each.
+/// `cos`/`sin` for the given positions, 32 values each.
 ///
-/// With text input the three position rows are identical, so the mRoPE
-/// interleaving reduces to one angle per frequency; `rope_tables` still takes the
-/// three rows because an image carries different ones.
-fn rope_tables(past: usize, sequence: usize) -> (Vec<[f32; 32]>, Vec<[f32; 32]>) {
+/// The three position indices are interleaved by frequency: index `i` of the
+/// 32 frequencies takes the temporal index when `i % 3 == 0`, the height index
+/// when `i % 3 == 1` and the width index when `i % 3 == 2`, with the section
+/// lengths from the configuration (11, 11, 10). Text repeats one index in all
+/// three, so the interleaving cannot be observed there; an image patch carries a
+/// grid position instead.
+///
+/// `cos`/`sin` are then doubled: `rotate_half` reads the first half against the
+/// second, so both halves hold the same angles.
+fn rope_tables(positions: &[[u32; 3]]) -> (Vec<[f32; 32]>, Vec<[f32; 32]>) {
     let rotary = manifest::ROTARY_DIM;
     let half = rotary / 2;
     let mut frequencies = Vec::with_capacity(half);
@@ -664,14 +718,14 @@ fn rope_tables(past: usize, sequence: usize) -> (Vec<[f32; 32]>, Vec<[f32; 32]>)
         let exponent = (2 * index) as f64 / rotary as f64;
         frequencies.push((1.0 / manifest::ROPE_THETA.powf(exponent)) as f32);
     }
-    let mut cos = Vec::with_capacity(sequence);
-    let mut sin = Vec::with_capacity(sequence);
-    for token in 0..sequence {
-        let position = (past + token) as f32;
+    let mut cos = Vec::with_capacity(positions.len());
+    let mut sin = Vec::with_capacity(positions.len());
+    for position in positions {
         let mut cosine = [0.0f32; 32];
         let mut sine = [0.0f32; 32];
         for index in 0..half {
-            let angle = position * frequencies[index];
+            let axis = index % 3;
+            let angle = position[axis] as f32 * frequencies[index];
             cosine[index] = angle.cos();
             sine[index] = angle.sin();
         }

@@ -37,7 +37,6 @@ fn main() {
     println!("workers       : {}", parallel::threads());
 
     let model = Model::new();
-    let mut cache = Cache::new();
     // One warm-up run: the first call faults in the weights' pages.
     let _ = model.forward(&[ids[0]], &mut Cache::new(), &mut NoTrace);
 

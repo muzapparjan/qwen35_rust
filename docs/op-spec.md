@@ -442,17 +442,75 @@ x = linear_fc2( GELU_exact( linear_fc1(x) ) )
 
 **GELU 在这里是精确 erf 版本**（`nn.GELU()`），与 §9.4 的 tanh 近似不是同一个函数。
 
-### 9.6 图像 token 进入文本序列
+### 9.6 图像 token 进入文本序列（实测钉住）
 
-`inputs_embeds.masked_scatter(input_ids == 248056, image_embeds)`：按出现顺序把
-`h*w/4` 个 merger 输出写进占位符位置。
+chat template 在图像位置写一个 `<|image_pad|>`（248056），**展开成 `h*w/4` 个**才交给
+模型；`vision_start`（248053）与 `vision_end`（248054）各一个，都是普通文本 token
+（`mm_token_type_ids` 为 0）。实测：`16x16` 的网格对应 64 个占位符，落在 `vision_start`
+与 `vision_end` 之间。
 
-### 9.7 图像预处理（M6 交付项，尚未读定）
+`mm_token_type_ids` **只有那 64 个占位符是 1**，两侧都是 0。位置按连续段给：
 
-`preprocessor_config.json` 给出：`size.shortest_edge = 65536`、
-`size.longest_edge = 16777216`、`patch_size 16`、`merge_size 2`、`mean/std = 0.5`，
-处理器是 `Qwen2VLImageProcessorFast`。M6 第一步是从该类源码读定 `smart_resize`
-的取整规则与重采样算法，并用 `processor` 的 dump 作为判据；在此之前不写这段代码。
+- 文本段：`arange(len) + current`，`current += len`；
+- 图像段：`t/1`、`h/2`、`w/2` 三个 `arange` 各加 `current` 后按 `(t, h, w)` 光栅序拼成
+  `[3, 64]`，然后 `current += max(h, w) / 2`（实测 16 的网格推进 8，不是 64）；
+- 生成阶段的偏移（参考叫 `rope_deltas`）：`最大位置 + 1 - 序列长度`，加到
+  `past + index` 上。**没有这一项，图像之后的每个 token 位置都会错**。
+
+merger 的行按出现顺序写进占位符位置（`masked_scatter`）。
+
+### 9.7 图像预处理（已读定，实测钉住）
+
+配置：`size.shortest_edge = 65536`、`size.longest_edge = 16777216`、
+`patch_size 16`、`merge_size 2`、`temporal_patch_size 2`、`mean/std = 0.5`、
+处理器 `Qwen2VLImageProcessorFast`（本版 transformers 里没有这个类，`image_processor_type`
+落到继承 `TorchvisionBackend` 的 `Qwen2VLImageProcessor`，实测走 **PIL** 的 `BICUBIC`）。
+
+`dev/dump_vision.py` 同时 dump 原始 RGB 字节与它产出的 `pixel_values`，下面的每一条都是
+拿这两者比出来的（探针在 `tmp/`，读数在 `dev/README.md`）：
+
+1. **`smart_resize`**：`factor = patch_size * merge_size = 32`。先按最近倍数取整
+   （`round(h/32)*32`）；若乘积超过 `longest_edge`，用 `beta = sqrt(h*w/max)` 后**下取整**；
+   若低于 `shortest_edge`，用 `beta = sqrt(min/(h*w))` 后**上取整**。长宽比超过 200:1 报错。
+   实测：`100x70 → 320x224`、`64x64 → 256x256`（两者都是被**放大**到 65536 像素以上）。
+2. **重采样**：bicubic，核是 **`a = -0.5`** 的三次核（PIL 的 BICUBIC），**不是** torchvision
+   `F.interpolate` 的 `a = -0.75`。采样位置 `src = (i + 0.5) * in / out - 0.5`，抽头
+   `floor(src) + {-1, 0, 1, 2}`；**出界的抽头被丢弃而不是夹到边界**，保留下来的权重再归一化。
+   实测：`a = -0.75` 差 4.5e-1、夹边界差 2.9e-1、丢弃+归一化差 1e-3 以内。
+3. **两遍各自落成字节**：水平遍的结果**取整并夹到 `[0,255]`** 后才进垂直遍，垂直遍同样处理。
+   这一条最容易被漏掉：只在整个流程末尾取整，饱和图上会差 **14 个灰度级**；加上它之后我的
+   实现在 196608 个值上与 PIL **逐位相同**（0 处不同）。
+4. **归一化**：`(v / 255 - 0.5) / 0.5`，一次 rescale，不会重复。
+5. **patch 化**：patch 顺序是**merge 块优先** —— 索引 `i` 解成
+   `in_col = i % 2`、`in_row = (i/2) % 2`、`block_col = (i/4) % blocks`、
+   `block_row = i / (4 * blocks)`，再 `row = block_row*2 + in_row`、`col = block_col*2 + in_col`。
+   每个 patch 向量内是 `(channel, temporal, patch_row, patch_col)`，图像只有一帧，被**复制
+   两次**填满 temporal。实测方式：每次只点亮一个 16×16 源块，看 `pixel_values` 里哪几行亮。
+
+**Rust 侧读数**（`cargo test --release --features reference-fixtures --test vision`）：
+
+| 用例 | 预处理 `max\|d\|` | tower 相对误差 | 端到端相对误差 |
+|---|---|---|---|
+| `square`（64×64 → 256×256） | 5.9e-8 | 1.0e-5 | 1.1e-5 |
+| `resized`（100×70 → 320×224） | 7.8e-3（正好一个灰度级） | 9.4e-6 | 3.5e-3 |
+
+`resized` 的预处理差一个灰度级，原因是 PIL 用定点系数；端到端 3.5e-3 是这一个灰度级被塔
+放大出来的（这个塔在 fixture 上把输入放大了两个数量级：block 11 的 `max|d|` 从 4 长到 1654）。
+两个数都来自实测，不是估计。
+
+**已实现并逐点对拍**（`src/vision/`）：预处理、塔、占位符展开、mRoPE 位置与生成偏移。
+Rust 侧读数与判据在下一节末尾。
+
+| 检查项 | `square`（64×64→256×256） | `resized`（100×70→320×224） |
+|---|---|---|
+| 预处理 `max\|d\|` | 5.9e-8 | 7.8e-3（一个灰度级） |
+| 塔（喂 dump 的 patch 行）相对误差 | 1.0e-5 | 9.4e-6 |
+| 整条图像 prompt 的 logits 相对误差 | 2.5e-6 | 2.5e-4 |
+| 图像之后走一步的相对误差 | 1.8e-6 | 3.0e-4 |
+| top-1（prompt 与之后一步） | 1919 / 2099，与参考相同 | 同左 |
+| 贪心生成与参考一致的 token 数 | 前 10 个，第 11 个分岔 | （未单独量） |
+| 我们渲染的 prompt 与处理器的 ids | 84 个，全等 | 90 个，全等 |
+
 
 ## 10. MTP（15 个张量）
 
