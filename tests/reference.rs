@@ -215,3 +215,179 @@ fn the_dump_describes_the_embedded_file() {
         other => panic!("the embedding table should be quantised, got {other:?}"),
     }
 }
+
+/// One corpus line: the text, the pieces the reference's pre-tokeniser made, and
+/// the ids the reference tokenizer produced.
+struct TokenCase {
+    text: String,
+    pieces: Vec<String>,
+    ids: Vec<u32>,
+}
+
+fn read_token_cases() -> Vec<TokenCase> {
+    let path = common::fixture("tokenizer.txt");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: {error}\nrun `python dev/dump_tokenizer.py` from the repository root first",
+            path.display()
+        )
+    });
+    let mut cases = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let mut fields = line.split('\t');
+        let decode = |field: &str| -> String {
+            if field == "-" {
+                return String::new();
+            }
+            let bytes: Vec<u8> = (0..field.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&field[index..index + 2], 16).expect("hex"))
+                .collect();
+            String::from_utf8(bytes).expect("the corpus is UTF-8")
+        };
+        let source = fields.next().expect("text");
+        let pieces = fields
+            .next()
+            .unwrap_or_else(|| panic!("line {}: no pieces", number + 1));
+        let ids = fields
+            .next()
+            .unwrap_or_else(|| panic!("line {}: no ids", number + 1));
+        cases.push(TokenCase {
+            text: decode(source),
+            pieces: if pieces == "-" {
+                Vec::new()
+            } else {
+                pieces.split(' ').map(decode).collect()
+            },
+            ids: if ids == "-" {
+                Vec::new()
+            } else {
+                ids.split(' ').map(|id| id.parse().expect("id")).collect()
+            },
+        });
+    }
+    cases
+}
+
+/// The full pipeline: added tokens, NFC, pre-tokeniser, BPE.
+///
+/// This is M2's criterion. Pieces are compared as well as ids, because a wrong
+/// split can still produce the right ids for short text and would leave the
+/// cause invisible.
+#[test]
+fn the_tokenizer_matches_the_reference_on_a_corpus() {
+    use qwen35::tokenizer::{normalize, pieces, tokenizer};
+
+    let cases = read_token_cases();
+    assert!(cases.len() >= 50, "{} cases", cases.len());
+    let tokenizer = tokenizer();
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+    for case in &cases {
+        let ids = tokenizer.encode(&case.text);
+        if ids != case.ids {
+            failures.push(format!(
+                "{:?}: ids {ids:?}, reference {:?}",
+                case.text, case.ids
+            ));
+            continue;
+        }
+        // The dump records the pieces of the normalised text as a whole, before
+        // added tokens are cut out, so this is the piece-level comparison.
+        let normalized = normalize(&case.text);
+        let actual: Vec<&str> = pieces(&normalized);
+        let expected: Vec<&str> = case.pieces.iter().map(String::as_str).collect();
+        if actual != expected {
+            failures.push(format!(
+                "{:?}: pieces {actual:?}, reference {expected:?}",
+                case.text
+            ));
+            continue;
+        }
+        checked += 1;
+    }
+    println!("tokenizer corpus: {checked}/{} cases", cases.len());
+    assert!(
+        failures.is_empty(),
+        "{} cases differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// The chat template, checked against the release's own Jinja output.
+///
+/// The fixture carries the messages as JSON because that is what the dump script
+/// has; the Rust side rebuilds the same messages from the case name, so the thing
+/// compared is the template's output rather than the fixture's encoding.
+#[test]
+fn the_chat_template_matches_the_release() {
+    use qwen35::chat::{self, Message, Options};
+
+    let path = common::fixture("chat.txt");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "{}: {error}\nrun `python dev/dump_chat.py` from the repository root first",
+            path.display()
+        )
+    });
+
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let name = fields.next().expect("case name");
+        let _messages = fields.next().expect("messages");
+        let thinking = fields.next().expect("thinking flag") == "1";
+        let encoded = fields.next().expect("output");
+        let expected: Vec<u8> = (0..encoded.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).expect("hex"))
+            .collect();
+        let expected = String::from_utf8(expected).expect("UTF-8");
+
+        let messages: Vec<Message> = match name {
+            "plain_user" | "plain_user_thinking" => vec![Message::user("你好")],
+            "system_then_user" => vec![
+                Message::system("You are helpful."),
+                Message::user("Hi"),
+            ],
+            "multi_turn" => vec![
+                Message::system("Be brief."),
+                Message::user("What is 2+2?"),
+                Message::assistant("4"),
+                Message::user("And 3+3?"),
+            ],
+            "assistant_reasoning" => vec![
+                Message::user("Add them."),
+                Message::assistant_thinking("4", "two plus two"),
+                Message::user("Thanks"),
+            ],
+            "whitespace_is_trimmed" => vec![
+                Message::system("  padded  \n"),
+                Message::user("\n  spaced  \n"),
+            ],
+            "content_parts" => vec![Message::user("part one, part two")],
+            "empty_user" => vec![Message::user("")],
+            other => panic!("{other}: no messages are defined for this case"),
+        };
+
+        let options = Options {
+            add_generation_prompt: true,
+            enable_thinking: thinking,
+        };
+        let actual = chat::render(&messages, &options).expect("renders");
+        if actual != expected {
+            failures.push(format!("{name}:\n  port     {actual:?}\n  reference {expected:?}"));
+            continue;
+        }
+        checked += 1;
+    }
+    println!("chat template: {checked} cases");
+    assert!(
+        failures.is_empty(),
+        "{} cases differ:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

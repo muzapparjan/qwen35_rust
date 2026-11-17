@@ -17,11 +17,17 @@ commit id，所以文件的 SHA256 就是它的身份。
 | `preprocessor_config.json` | 410 | `2767d5efeb29362bc8e25e8e6baa9bc862da73fdcb5eee4db4e7f23f6625b6f7` | 图像尺寸与归一化参数 |
 | `model.safetensors-00001-of-00001.safetensors` | 1,746,942,600 | 未在仓内重算（1.7 GB） | 量化器的输入；索引里的 `total_size` 是 1,746,882,752 |
 
-## 量化容器（由上面的快照导出）
+## 嵌入的表（衍生自上面的材料）
 
-| 文件 | 字节 | SHA256 | 用途 |
+| 文件 | 字节 | SHA256 | 内容 |
 |---|---:|---|---|
-| `qwen3.5-0.8b-q4.qwqt` | 494,845,446 | `29773850a7ac53122e1544a24748701b55fa59ca63fed89cae71b9baabc7dfb9` | 嵌入本 crate 的权重 |
+| `src/weights/qwen3.5-0.8b-q4.qwqt` | 494,845,446 | `29773850a7ac53122e1544a24748701b55fa59ca63fed89cae71b9baabc7dfb9` | 权重容器，逐字节复制 |
+| `src/tokenizer/data/tokenizer.bin` | 5,808,391 | `a6a72c72711a3b8f9cc9274ae4f498de31e18df600cb141ac5977a202543be0f` | 词表、merges、added tokens |
+| `src/tokenizer/data/unicode.bin` | 83,104 | `90ec30d9b7d3a18689fcb0ae8a8950e714eb3480b5450d9d49e4df28e7fb1804` | 字符类、组合类、NFC 表 |
+
+`unicode.bin` 不是从任何一个 Unicode 版本拷来的：字符类与组合类是**实测**参考
+0.23.3 的行为得到的（见 `dev/gen_unicode.py`），分解对来自 UnicodeData 14.0.0 并由
+参考判定哪些可合成。
 
 容器的生成策略记在它自己的 header 里：`g32 bits=4 embed=4 vision=4 first_last=0x8
 overrides=none clip_search=True`。

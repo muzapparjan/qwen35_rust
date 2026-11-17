@@ -572,6 +572,45 @@ ids 实测（这些同时是 `tests/golden.rs` 的用例）：
 `<|im_end|>` 是 248046，而 `generation_config.eos_token_id` 是 248044 —— 两者不同，
 生成循环按前者停还是按后者停会得到不同长度的输出，必须显式选择并记录。
 
+### 15.1 管线的顺序（实测）
+
+```
+raw text
+  -> 在原始文本上切出 33 个 added token（它们的 normalized=false）
+  -> 每段剩余文本做 NFC
+  -> 预分词正则切 piece
+  -> 每个 piece 做 byte-level BPE
+```
+
+三点后果：
+
+1. added token 的字节**不经过**归一化，也不会被预分词拆开，所以 `<|im_end|>` 永远是
+   一个 id。
+2. 归一化不会跨过 added token 合并字符（两侧是分别归一化的）。
+3. BPE 只在 piece 内做合并，跨 piece 不会合并。
+
+### 15.2 kind 与 kind 的差异（实测）
+
+| 事实 | 读数 |
+|---|---|
+| merge 产物 id | **不全是** `256 + rank`：id 104,328 处多插了一个 token，之后整体 +1。编码器用 id 当优先级，因此要求 id 随 rank 严格递增（成立） |
+| byte 的 id | 词表按频率排序，空格是 32 而它的 token 是 220；256 个 byte 的 id 恰是 0..=255 的一个排列 |
+| `\s*[\r\n]+` | 只在空白串**以换行结尾**时匹配：`"\n\n  "` → `["\n\n", "  "]` |
+| `\s+(?!\S)` | 让回一个字符：`"    return"` → `["   ", " return"]` |
+| `\p{L}`/`\p{M}`/`\p{N}` | 必须用参考自己的类表：Python 的 Unicode 14 与参考在 9,485 个码点上不同 |
+| 组合类 | 必须用参考测出的值：Python 与参考在 119 个 mark 上不同（方向相反） |
+
+### 15.3 chat template 的文本子集（实测）
+
+| 事实 | 读数 |
+|---|---|
+| 内容 | 一律 `trim`；多段 `content` 直接拼接后 `trim` |
+| system | 只在第一条；其余位置报错 |
+| assistant 的 `<think>` 块 | 仅当该条在**最后一条 user 之后**；之前的 assistant 消息里的 reasoning 被丢弃 |
+| 生成提示（`enable_thinking=false`） | `<|im_start|>assistant\n<think>\n\n</think>\n\n` |
+| 生成提示（`enable_thinking=true`） | `<|im_start|>assistant\n<think>\n` |
+| 没有 user 消息 | 报错（`No user query found in messages.`） |
+
 ## 16. 两条实现纪律（从实测里来的）
 
 1. **不物化 `[S, vocab]` 的 logits。** 前期实测：8192 上下文默认路径产生 7,760 MiB

@@ -8,6 +8,8 @@
 //! The weights are a QWQT container embedded with `include_bytes!`, so the
 //! library performs no file IO at run time.
 
+mod blob;
+pub mod chat;
 pub mod cpu;
 pub mod ops;
 pub mod tokenizer;

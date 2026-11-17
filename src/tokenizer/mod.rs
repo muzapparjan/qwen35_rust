@@ -21,12 +21,15 @@
 //! callers must supply the pieces.
 
 pub mod manifest;
+mod split;
+mod unicode;
+pub mod unicode_manifest;
 
+pub use split::pieces;
+pub use unicode::normalize;
+
+use crate::blob::{u32_at, Aligned};
 use std::sync::OnceLock;
-
-/// A byte buffer aligned so the `u32` sections can be read without a copy.
-#[repr(C, align(64))]
-pub struct Aligned<const N: usize>(pub [u8; N]);
 
 static BLOB: Aligned<{ manifest::FILE_LEN }> = Aligned(*include_bytes!("data/tokenizer.bin"));
 
@@ -85,15 +88,6 @@ static INSTANCE: OnceLock<Tokenizer> = OnceLock::new();
 /// The shared tokenizer, parsed on first use.
 pub fn tokenizer() -> &'static Tokenizer {
     INSTANCE.get_or_init(Tokenizer::parse)
-}
-
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        bytes[offset],
-        bytes[offset + 1],
-        bytes[offset + 2],
-        bytes[offset + 3],
-    ])
 }
 
 impl Tokenizer {
@@ -287,15 +281,22 @@ impl Tokenizer {
         ids
     }
 
-    /// Tokenise `text`, treating it as a single piece, with added tokens split
-    /// out first. This is only correct for text that the pre-tokeniser would
-    /// leave whole; [`Tokenizer::encode_pieces`] is the general entry point.
-    pub fn encode_whole(&self, text: &str) -> Vec<u32> {
+    /// Tokenise `text` the way the release does.
+    ///
+    /// Added tokens are cut out of the raw text first, so their bytes are never
+    /// normalised or split; each remaining stretch is normalised to NFC, split by
+    /// the pre-tokeniser and encoded piece by piece.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
         for segment in self.split_added(text) {
             match segment {
                 Segment::Added(id) => ids.push(id),
-                Segment::Text(piece) => ids.extend(self.encode_piece(piece)),
+                Segment::Text(rest) => {
+                    let normalized = unicode::normalize(rest);
+                    for piece in split::pieces(&normalized) {
+                        ids.extend(self.encode_piece(piece));
+                    }
+                }
             }
         }
         ids
@@ -409,7 +410,7 @@ mod tests {
                 Segment::Text("there")
             ]
         );
-        let ids = tokenizer.encode_whole("hi<|im_end|>there");
+        let ids = tokenizer.encode("hi<|im_end|>there");
         assert_eq!(ids[0], 5834, "hi");
         assert_eq!(ids[1], manifest::IM_END);
         assert_eq!(tokenizer.decode(&ids), "hi<|im_end|>there");

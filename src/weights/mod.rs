@@ -11,16 +11,8 @@
 
 pub mod manifest;
 
+use crate::blob::Aligned;
 use manifest::{TensorSpec, FILE_LEN, TENSORS};
-
-/// A byte buffer aligned so it can be reinterpreted as `f32` or `u16` without a
-/// copy.
-///
-/// `include_bytes!` gives no alignment guarantee; a misaligned `f32` slice would
-/// be undefined behaviour. The container aligns every tensor buffer to 64 bytes,
-/// so one aligned base is enough for all of them.
-#[repr(C, align(64))]
-pub struct Aligned<const N: usize>(pub [u8; N]);
 
 // `Aligned<N>` fixes the length, so a container swapped for a different one
 // stops the build instead of letting the manifest address bytes that are not
