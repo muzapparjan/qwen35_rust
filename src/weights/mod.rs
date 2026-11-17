@@ -76,10 +76,38 @@ pub struct Tensor {
     pub data: Data,
 }
 
+/// A tensor seen as a matrix: every dimension but the last is a row.
+///
+/// Linear-layer weights are `[out_features, in_features]`, which is the shape
+/// PyTorch uses, so no transpose is needed before a matrix-vector product.
+#[derive(Clone, Copy, Debug)]
+pub struct Matrix {
+    pub rows: usize,
+    pub columns: usize,
+    pub data: Data,
+    /// `f32`, `bf16`, `f16` or `q4`; the dense kinds differ in how two bytes
+    /// become a number.
+    pub kind: &'static str,
+    /// Values per scale group; only meaningful for `Data::Quantized`.
+    pub group: usize,
+}
+
 impl Tensor {
     /// Number of values, the product of the shape.
     pub fn numel(&self) -> usize {
         self.spec.shape.iter().product()
+    }
+
+    /// This tensor as a matrix.
+    pub fn matrix(&self) -> Matrix {
+        let columns = *self.spec.shape.last().expect("a tensor has a shape");
+        Matrix {
+            rows: self.numel() / columns,
+            columns,
+            data: self.data,
+            kind: self.spec.kind,
+            group: self.spec.group,
+        }
     }
 
     /// The tensor's whole buffer, scales and padding included.

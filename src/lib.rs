@@ -11,6 +11,7 @@
 mod blob;
 pub mod chat;
 pub mod cpu;
+pub mod model;
 pub mod ops;
 pub mod tokenizer;
 pub mod weights;

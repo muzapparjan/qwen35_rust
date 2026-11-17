@@ -1,5 +1,8 @@
 /target
 /tmp
-/dev
+# The development scripts stay local; the note that records what they measured
+# and with which command does not, so the numbers survive a clone.
+/dev/*
+!/dev/README.md
 # A library: the resolver is the consumer's choice.
 /Cargo.lock

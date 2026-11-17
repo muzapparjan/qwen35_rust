@@ -234,6 +234,270 @@ unsafe fn dequantize_avx2(bits: u8, group: usize, scales: &[u8], integers: &[u8]
     }
 }
 
+/// `sum_i a[i] * b[i]`, four accumulator chains.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    let mut sums = [0.0f32; 4];
+    let mut left = a.chunks_exact(4);
+    let mut right = b.chunks_exact(4);
+    for (x, y) in left.by_ref().zip(right.by_ref()) {
+        sums[0] += x[0] * y[0];
+        sums[1] += x[1] * y[1];
+        sums[2] += x[2] * y[2];
+        sums[3] += x[3] * y[3];
+    }
+    let mut total = (sums[0] + sums[1]) + (sums[2] + sums[3]);
+    for (x, y) in left.remainder().iter().zip(right.remainder()) {
+        total += x * y;
+    }
+    total
+}
+
+/// The value of row `index` of `weight`, expanded to `f32`.
+///
+/// Used for the embedding lookup: 18 rows of 1024 values, not a whole table.
+pub fn row_values(weight: &crate::weights::Matrix, index: usize, out: &mut [f32]) {
+    assert!(index < weight.rows, "row {index} of {}", weight.rows);
+    assert_eq!(out.len(), weight.columns);
+    match weight.data {
+        crate::weights::Data::Quantized {
+            scales,
+            integers,
+            bits,
+        } => {
+            let columns = weight.columns;
+            let groups = columns / weight.group;
+            let scale_bytes = 2 * groups;
+            let value_bytes = columns * bits as usize / 8;
+            dequantize(
+                bits,
+                weight.group,
+                &scales[index * scale_bytes..(index + 1) * scale_bytes],
+                &integers[index * value_bytes..(index + 1) * value_bytes],
+                out,
+            );
+        }
+        crate::weights::Data::F32(bytes) => {
+            let start = index * 4 * weight.columns;
+            for (slot, chunk) in out.iter_mut().zip(bytes[start..].chunks_exact(4)) {
+                *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+        }
+        crate::weights::Data::Half(bytes) => {
+            let start = index * 2 * weight.columns;
+            let row = &bytes[start..start + 2 * weight.columns];
+            for (slot, chunk) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *slot = match weight.kind {
+                    "bf16" => f32::from_bits(u32::from(u16::from_le_bytes([chunk[0], chunk[1]])) << 16),
+                    _ => f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])),
+                };
+            }
+        }
+    }
+}
+
+/// `out[t, o] = sum_i x[t, i] * weight[o, i]`, reading the weight in place.
+///
+/// A quantised weight is never expanded into a whole `f32` matrix: the inner
+/// loop decodes one group at a time, so the memory a call needs is the input,
+/// the output and one group's worth of values.
+pub fn linear(
+    x: &[f32],
+    rows: usize,
+    weight: &crate::weights::Matrix,
+    bias: Option<&[f32]>,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), rows * weight.columns, "input shape");
+    assert_eq!(out.len(), rows * weight.rows, "output shape");
+    if let Some(bias) = bias {
+        assert_eq!(bias.len(), weight.rows, "bias shape");
+    }
+    match weight.data {
+        crate::weights::Data::Quantized {
+            scales,
+            integers,
+            bits,
+        } => {
+            assert_eq!(bits, 4, "only four-bit weights are used by this model");
+            let columns = weight.columns;
+            let group = weight.group;
+            let groups = columns / group;
+            for row in 0..rows {
+                let source = &x[row * columns..(row + 1) * columns];
+                let target = &mut out[row * weight.rows..(row + 1) * weight.rows];
+                for (output, slot) in target.iter_mut().enumerate() {
+                    let scale_base = output * groups;
+                    let integer_base = output * columns / 2;
+                    let mut total = 0.0f32;
+                    for group_index in 0..groups {
+                        let scale = f16_to_f32(u16::from_le_bytes([
+                            scales[2 * (scale_base + group_index)],
+                            scales[2 * (scale_base + group_index) + 1],
+                        ]));
+                        let bytes = &integers
+                            [integer_base + group_index * group / 2..integer_base + (group_index + 1) * group / 2];
+                        let source_base = group_index * group;
+                        // Two chains, one per nibble lane: the low nibbles and the
+                        // high nibbles are independent sums until the end.
+                        let mut low_sum = 0.0f32;
+                        let mut high_sum = 0.0f32;
+                        for (pair, byte) in bytes.iter().enumerate() {
+                            let low = f32::from(i16::from(byte & 0x0f) - 8);
+                            let high = f32::from(i16::from(byte >> 4) - 8);
+                            let index = source_base + 2 * pair;
+                            low_sum += low * source[index];
+                            high_sum += high * source[index + 1];
+                        }
+                        total += (low_sum + high_sum) * scale;
+                    }
+                    *slot = match bias {
+                        Some(bias) => total + bias[output],
+                        None => total,
+                    };
+                }
+            }
+        }
+        _ => {
+            // Dense weights are the small ones (norms, conv, the two 16-wide
+            // projections), so expanding them per call costs nothing.
+            let mut dense = vec![0.0f32; weight.rows * weight.columns];
+            for row in 0..weight.rows {
+                row_values(
+                    weight,
+                    row,
+                    &mut dense[row * weight.columns..(row + 1) * weight.columns],
+                );
+            }
+            for row in 0..rows {
+                let source = &x[row * weight.columns..(row + 1) * weight.columns];
+                let target = &mut out[row * weight.rows..(row + 1) * weight.rows];
+                for (output, slot) in target.iter_mut().enumerate() {
+                    let weights = &dense[output * weight.columns..(output + 1) * weight.columns];
+                    *slot = match bias {
+                        Some(bias) => dot(source, weights) + bias[output],
+                        None => dot(source, weights),
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// `silu(x) = x * sigmoid(x)`.
+pub fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+/// `sigmoid(x)`.
+pub fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+/// `softplus(x)`, with torch's default threshold: `x` itself above 20.
+pub fn softplus(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        value.exp().ln_1p()
+    }
+}
+
+/// Zero-centred RMS normalisation over the last axis: `x / rms(x) * (1 + w)`.
+pub fn rms_norm_zero_centered(
+    x: &[f32],
+    rows: usize,
+    width: usize,
+    weight: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), rows * width);
+    assert_eq!(weight.len(), width);
+    assert_eq!(out.len(), rows * width);
+    for row in 0..rows {
+        let source = &x[row * width..(row + 1) * width];
+        let target = &mut out[row * width..(row + 1) * width];
+        let mean_square = source.iter().map(|value| value * value).sum::<f32>() / width as f32;
+        let inverse = 1.0 / (mean_square + eps).sqrt();
+        for index in 0..width {
+            target[index] = source[index] * inverse * (1.0 + weight[index]);
+        }
+    }
+}
+
+/// Gated RMS normalisation: `w * x / rms(x) * silu(gate)`, per row of `width`.
+pub fn rms_norm_gated(
+    x: &[f32],
+    gate: &[f32],
+    rows: usize,
+    width: usize,
+    weight: &[f32],
+    eps: f32,
+    out: &mut [f32],
+) {
+    assert_eq!(x.len(), rows * width);
+    assert_eq!(gate.len(), rows * width);
+    assert_eq!(weight.len(), width);
+    assert_eq!(out.len(), rows * width);
+    for row in 0..rows {
+        let source = &x[row * width..(row + 1) * width];
+        let gate = &gate[row * width..(row + 1) * width];
+        let target = &mut out[row * width..(row + 1) * width];
+        let mean_square = source.iter().map(|value| value * value).sum::<f32>() / width as f32;
+        let inverse = 1.0 / (mean_square + eps).sqrt();
+        for index in 0..width {
+            target[index] = weight[index] * source[index] * inverse * silu(gate[index]);
+        }
+    }
+}
+
+/// Divide a row by the square root of its sum of squares plus `eps`.
+pub fn l2_normalize(row: &mut [f32], eps: f32) {
+    let sum: f32 = row.iter().map(|value| value * value).sum();
+    let inverse = 1.0 / (sum + eps).sqrt();
+    for value in row.iter_mut() {
+        *value *= inverse;
+    }
+}
+
+/// In-place softmax over a row, in `f32` like the reference's attention.
+pub fn softmax(row: &mut [f32]) {
+    let mut largest = f32::NEG_INFINITY;
+    for value in row.iter() {
+        if *value > largest {
+            largest = *value;
+        }
+    }
+    let mut total = 0.0f32;
+    for value in row.iter_mut() {
+        let exponent = (*value - largest).exp();
+        *value = exponent;
+        total += exponent;
+    }
+    let inverse = 1.0 / total;
+    for value in row.iter_mut() {
+        *value *= inverse;
+    }
+}
+
+/// Rotate the first `rotary` values of `vector` with `rotate_half` pairing.
+///
+/// The pairs are `(i, i + rotary/2)`, and `cos`/`sin` hold `rotary/2` values
+/// because the rotation repeats them over both halves.
+pub fn apply_rope(vector: &mut [f32], rotary: usize, cos: &[f32], sin: &[f32]) {
+    let half = rotary / 2;
+    assert!(vector.len() >= rotary);
+    assert_eq!(cos.len(), half);
+    assert_eq!(sin.len(), half);
+    for index in 0..half {
+        let a = vector[index];
+        let b = vector[index + half];
+        vector[index] = a * cos[index] - b * sin[index];
+        vector[index + half] = b * cos[index] + a * sin[index];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

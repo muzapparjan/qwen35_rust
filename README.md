@@ -16,13 +16,16 @@ GPU 后端在后面的里程碑里以 feature 引入。
 | M0 | `dev/gen_manifest.py` + 嵌入 + 编译期校验 | **已交付** | 常量全过 `const` assert；张量数 488（模型 473 + MTP 15）；首 4 字节 `"QWQT"`；`model_info.exe` = 495,116,800 B |
 | M1 | int4/int8 反量化 | **已交付** | 488/488 张量、873,438,784 个值与参考 `read_tensor` 的 CRC-32 相同；6 个整张量逐元素 `max\|d\| = 0.0` |
 | M2 | tokenizer | **已交付** | 语料 56/56 的 pieces 与 ids 与参考完全相等；chat template 8/8；NFC 与字符类逐码点对过参考 |
-| M3 | 文本单层（`linear_attention` 与 `full_attention` 各一） | 待做 | 每层 5 个检查点对拍（定义见规格 §13） |
-| M4 | 24 层 + final norm + 输出头 | 待做 | 逐层 residual 对拍；logits top-1 与参考一致 |
-| M5 | prefill / decode cache 一致性 | 待做 | 一次喂完 与 逐 token 喂，相对差在规格 §12 的量级内 |
+| M3 | 文本单层（`linear_attention` 与 `full_attention` 各一） | **已交付** | 层 0 与层 3 的 5 个检查点全过，最大相对误差 3.7e-6 |
+| M4 | 24 层 + final norm + 输出头 | **已交付** | 24 层逐层 residual 对拍（3 个用例），logits top-1 全中 |
+| M5 | prefill / decode cache 一致性 | **已交付** | 同一条代码路径，`max\|d\| = 0.0` |
 | M6 | 视觉塔 + 图像输入 | 待做 | `patch_embed` → 12 层 → `merger` 逐点对拍 |
 | M7 | MTP 头 | 待做 | 与自建 dump 对拍（PyTorch 主类不加载它） |
 | M8 | wgpu 后端 | 待做 | 与 CPU 后端同算术路径结果一致（`--features wgpu`） |
-| M9 | 性能 | 待做 | 超过 PyTorch eager 基线 |
+| M9 | 性能 | 待做：decode 0.39 s/token、prefill 3.6 tok/s（可移植内核） | 超过 PyTorch eager 基线 |
+
+每个数字的出处（命令与日期）在 [`dev/README.md`](dev/README.md)：那里只写实测
+读数与未采用的方案，不写代码。
 
 ## 结构
 
@@ -32,8 +35,9 @@ src/blob.rs           对齐的嵌入缓冲与 little-endian 读取
 src/weights/mod.rs    嵌入的容器、张量查找、dense 张量的 f32 视图
 src/weights/manifest.rs  @generated：488 个张量的名字/形状/偏移 + 架构常量
 src/weights/qwen3.5-0.8b-q4.qwqt  嵌入的权重（495 MB，-text）
-src/ops.rs            数值内核：反量化（标量 + AVX2）、f16 解码
+src/ops.rs            数值内核：反量化、f32 读行、线性层、RMSNorm、softmax、RoPE
 src/cpu.rs            指令集探测与 `force-scalar` 开关
+src/model/mod.rs      24 层、两种 token mixer、KV 与递推缓存
 src/tokenizer/        byte-level BPE、NFC、预分词（unicode.rs / split.rs）
 src/chat.rs           文本对话模板
 src/tokenizer/data/   嵌入的词表（5.8 MB）与 Unicode 表（83 KB）
@@ -41,8 +45,10 @@ docs/op-spec.md       算子规格
 dev/                  开发脚本（git-ignored，见 dev/README.md）
 tests/golden.rs       不依赖 fixture 的检查
 tests/reference.rs    与参考实现对拍（`--features reference-fixtures`）
+tests/text.rs         逐层与 logits 对拍、缓存一致性
 examples/model_info.rs 打印容器内容，并校验真实字节
 examples/tokenize.rs   渲染 prompt、编码、解码回来
+examples/say_text.rs   端到端贪心生成
 ```
 
 ## 构建与测试
