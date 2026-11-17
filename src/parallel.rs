@@ -182,6 +182,47 @@ impl Pool {
             }
         });
     }
+
+    /// Split two independent buffers into matching chunks and run
+    /// `body(index, first, second)` in parallel.
+    ///
+    /// The strides differ in practice (a head's recurrent state and its output
+    /// have different lengths), so each side takes its own chunk length; what
+    /// must agree is the number of chunks, which is checked.
+    pub fn chunks_mut_pair<A: Send, B: Send>(
+        &self,
+        first_chunk: usize,
+        first: &mut [A],
+        second_chunk: usize,
+        second: &mut [B],
+        body: &(dyn Fn(usize, &mut [A], &mut [B]) + Sync),
+    ) {
+        assert!(first_chunk > 0 && second_chunk > 0, "chunk lengths must be positive");
+        let parts = first.len().div_ceil(first_chunk);
+        assert_eq!(
+            parts,
+            second.len().div_ceil(second_chunk),
+            "the two buffers split into a different number of parts"
+        );
+        let mut queue: Vec<(usize, &mut [A], &mut [B])> = first
+            .chunks_mut(first_chunk)
+            .zip(second.chunks_mut(second_chunk))
+            .enumerate()
+            .map(|(index, (left, right))| (index, left, right))
+            .collect();
+        if queue.len() == 1 {
+            let (index, left, right) = queue.pop().expect("one chunk");
+            body(index, left, right);
+            return;
+        }
+        let queue = Mutex::new(queue);
+        self.parallel_for(parts, &|_| {
+            let next = queue.lock().expect("chunk mutex poisoned").pop();
+            if let Some((index, left, right)) = next {
+                body(index, left, right);
+            }
+        });
+    }
 }
 
 impl Drop for Pool {
@@ -264,7 +305,7 @@ fn worker(shared: Arc<Shared>, index: usize) {
 /// third, the workers having started to fight over the same caches.
 /// [`set_threads`] overrides it, which is how `examples/bench.rs` sweeps the
 /// value.
-const MAX_WORKERS: usize = 8;
+const MAX_WORKERS: usize = 16;
 
 static REQUESTED: AtomicUsize = AtomicUsize::new(0);
 static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();

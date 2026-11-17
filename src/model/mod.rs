@@ -401,46 +401,69 @@ impl Model {
         let dt_bias = vector(layer, "linear_attn.dt_bias");
 
         // --- the recurrence
+        //
+        // The heads are independent: each has its own state, and the token axis
+        // of one head depends on nothing but that head. Walking tokens outside
+        // heads would make every head wait for its predecessor's token, which is
+        // what left this the one section of prefill that did not answer to more
+        // workers. The work per head is written head-major and transposed
+        // afterwards.
         let scale = 1.0 / (key_head_dim as f32).sqrt();
-        let mut core = vec![0.0f32; sequence * value_dim];
-        let mut query = vec![0.0f32; key_head_dim];
-        let mut key = vec![0.0f32; key_head_dim];
-        let mut value = vec![0.0f32; value_head_dim];
-        let mut memory = vec![0.0f32; value_head_dim];
-        let mut delta = vec![0.0f32; value_head_dim];
-        for token in 0..sequence {
-            let base = token * conv_dim;
-            let decay_base = token * heads;
-            for head in 0..heads {
-                for index in 0..key_head_dim {
-                    query[index] = convolved[base + head * key_head_dim + index];
-                    key[index] = convolved[base + key_dim + head * key_head_dim + index];
-                }
-                for index in 0..value_head_dim {
-                    value[index] = convolved[base + 2 * key_dim + head * value_head_dim + index];
-                }
-                ops::l2_normalize(&mut query, 1e-6);
-                ops::l2_normalize(&mut key, 1e-6);
-                for index in 0..key_head_dim {
-                    query[index] *= scale;
-                }
+        let mut by_head = vec![0.0f32; heads * sequence * value_head_dim];
+        let state_len = key_head_dim * value_head_dim;
+        let head_len = sequence * value_head_dim;
+        crate::parallel::pool().chunks_mut_pair(
+            state_len,
+            &mut cache.state,
+            head_len,
+            &mut by_head,
+            &|head, state, out| {
+                let mut query = vec![0.0f32; key_head_dim];
+                let mut key = vec![0.0f32; key_head_dim];
+                let mut value = vec![0.0f32; value_head_dim];
+                let mut memory = vec![0.0f32; value_head_dim];
+                let mut delta = vec![0.0f32; value_head_dim];
+                for token in 0..sequence {
+                    let base = token * conv_dim;
+                    let decay_base = token * heads;
+                    for index in 0..key_head_dim {
+                        query[index] = convolved[base + head * key_head_dim + index];
+                        key[index] = convolved[base + key_dim + head * key_head_dim + index];
+                    }
+                    for index in 0..value_head_dim {
+                        value[index] = convolved[base + 2 * key_dim + head * value_head_dim + index];
+                    }
+                    ops::l2_normalize(&mut query, 1e-6);
+                    ops::l2_normalize(&mut key, 1e-6);
+                    for index in 0..key_head_dim {
+                        query[index] *= scale;
+                    }
 
-                let beta = ops::sigmoid(b[decay_base + head]);
-                let decay = (-(a_log[head].exp()) * ops::softplus(a[decay_base + head] + dt_bias[head])).exp();
-                let state = &mut cache.state
-                    [head * key_head_dim * value_head_dim..(head + 1) * key_head_dim * value_head_dim];
-                ops::scale_all(state, decay);
-                // memory = S^T k
-                ops::transposed_matvec(state, key_head_dim, value_head_dim, &key, &mut memory);
-                for index in 0..value_head_dim {
-                    delta[index] = (value[index] - memory[index]) * beta;
+                    let beta = ops::sigmoid(b[decay_base + head]);
+                    let decay = (-(a_log[head].exp())
+                        * ops::softplus(a[decay_base + head] + dt_bias[head]))
+                    .exp();
+                    ops::scale_all(state, decay);
+                    // memory = S^T k
+                    ops::transposed_matvec(state, key_head_dim, value_head_dim, &key, &mut memory);
+                    for index in 0..value_head_dim {
+                        delta[index] = (value[index] - memory[index]) * beta;
+                    }
+                    ops::outer_add(state, key_head_dim, value_head_dim, &key, &delta);
+                    // output = S^T q
+                    ops::transposed_matvec(state, key_head_dim, value_head_dim, &query, &mut memory);
+                    out[token * value_head_dim..(token + 1) * value_head_dim]
+                        .copy_from_slice(&memory);
                 }
-                ops::outer_add(state, key_head_dim, value_head_dim, &key, &delta);
-                // output = S^T q
-                ops::transposed_matvec(state, key_head_dim, value_head_dim, &query, &mut memory);
-                for index in 0..value_head_dim {
-                    core[(token * heads + head) * value_head_dim + index] = memory[index];
-                }
+            },
+        );
+        let mut core = vec![0.0f32; sequence * value_dim];
+        for head in 0..heads {
+            for token in 0..sequence {
+                let source = (head * sequence + token) * value_head_dim;
+                let target = (token * heads + head) * value_head_dim;
+                core[target..target + value_head_dim]
+                    .copy_from_slice(&by_head[source..source + value_head_dim]);
             }
         }
         record!(
@@ -582,35 +605,37 @@ impl Model {
         cache.positions = total;
 
         // --- attention over the cached prefix, causal
+        //
+        // A (token, head) pair depends on nothing else: the prefix is already in
+        // the cache and the pairs only read it. Chunking `attended` by head width
+        // gives exactly that pairing, so the split needs no transpose.
         let scaling = 1.0 / (head_dim as f32).sqrt();
         let mut attended = vec![0.0f32; sequence * heads * head_dim];
-        let mut scores = vec![0.0f32; total];
-        for token in 0..sequence {
+        crate::parallel::pool().chunks_mut(head_dim, &mut attended, &|index, target| {
+            let token = index / heads;
+            let head = index % heads;
             let visible = past + token + 1;
-            for head in 0..heads {
-                let kv_head = head / groups;
-                let base = (token * heads + head) * head_dim;
-                scores.truncate(visible);
-                scores.resize(visible, 0.0);
-                for position in 0..visible {
-                    let other = position * head_dim;
-                    scores[position] = ops::dot(
-                        &query[base..base + head_dim],
-                        &cache.keys[kv_head][other..other + head_dim],
-                    ) * scaling;
-                }
-                ops::softmax(&mut scores);
-                let target = &mut attended[base..base + head_dim];
-                target.fill(0.0);
-                for position in 0..visible {
-                    let weight = scores[position];
-                    let other = position * head_dim;
-                    for index in 0..head_dim {
-                        target[index] += weight * cache.values[kv_head][other + index];
-                    }
+            let kv_head = head / groups;
+            let base = (token * heads + head) * head_dim;
+            let mut scores = vec![0.0f32; visible];
+            for position in 0..visible {
+                let other = position * head_dim;
+                scores[position] = ops::dot(
+                    &query[base..base + head_dim],
+                    &cache.keys[kv_head][other..other + head_dim],
+                ) * scaling;
+            }
+            ops::softmax(&mut scores);
+            target.fill(0.0);
+            for position in 0..visible {
+                let weight = scores[position];
+                let other = position * head_dim;
+                let values = &cache.values[kv_head][other..other + head_dim];
+                for (slot, value) in target.iter_mut().zip(values) {
+                    *slot += weight * value;
                 }
             }
-        }
+        });
 
         // --- the gate, then the output projection
         for index in 0..attended.len() {

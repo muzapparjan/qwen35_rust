@@ -22,7 +22,7 @@ GPU 后端在后面的里程碑里以 feature 引入。
 | M6 | 视觉塔 + 图像输入 | 待做 | `patch_embed` → 12 层 → `merger` 逐点对拍 |
 | M7 | MTP 头 | 待做 | 与自建 dump 对拍（PyTorch 主类不加载它） |
 | M8 | wgpu 后端 | 待做 | 与 CPU 后端同算术路径结果一致（`--features wgpu`） |
-| M9 | 性能 | **进行中**：decode 0.028 s/token（基线 0.089，快 3.2 倍）；prefill 0.48 s ＝ 170 tok/s（基线 0.323 s ＝ 250） | 超过 PyTorch eager 基线（同一时间窗内交替测量；这台机器有常驻负载，不同窗口的绝对值不可比） |
+| M9 | 性能 | **已交付**：prefill 0.333 s ＝ 243 tok/s、decode 0.020 s/token（同窗口基线 0.422 s ＝ 192 tok/s、0.113 s/token，即 prefill 1.27 倍、decode 5.6 倍） | 超过 PyTorch eager 基线（两实现交替测量；这台机器有常驻负载，不同窗口的绝对值不可比） |
 
 每个数字的出处（命令与日期）在 [`dev/README.md`](dev/README.md)：那里只写实测
 读数与未采用的方案，不写代码。
