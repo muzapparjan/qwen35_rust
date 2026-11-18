@@ -192,8 +192,19 @@ slot 叠到同一块存储上，回读点名的 slot 不共享存储。
 `examples/model_info.rs` 报的 495,116,800 B 是嵌入的代价：它对真实字节做校验和，而不是读
 类型里的长度。
 
-## 许可与第三方
+## 许可
 
-Apache-2.0。权重、tokenizer、chat template 是 Qwen 团队的 Apache-2.0 作品；
-本构建所用的每个文件的字节数与 SHA256 见 [`THIRD-PARTY.md`](THIRD-PARTY.md) 与
-[`NOTICE`](NOTICE)。
+本仓的代码是 **Apache-2.0**，见 [`LICENSE`](LICENSE)。
+
+它**分发**三份衍生数据（它们嵌在仓库里，不是运行时读的外部文件），义务因此不止是「引用」：
+
+| 文件 | 上游 | 与上游的关系 |
+|---|---|---|
+| `src/weights/qwen3.5-0.8b-q4.qwqt` | Qwen3.5-0.8B 权重（Apache-2.0，Copyright 2026 Alibaba Cloud） | `quantized/` 里那份额外 4-bit 量化产物的逐字节复制 |
+| `src/tokenizer/data/tokenizer.bin` | 模型的 `tokenizer.json` / `tokenizer_config.json`（同上） | 重新编码成打包表 |
+| `src/tokenizer/data/unicode.bin` | Unicode 数据（Unicode-3.0） | 由 UCD 与参考分词器的实测行为生成 |
+
+上游的版权声明、逐文件的改动说明与 Unicode 的许可声明在 [`NOTICE`](NOTICE)；输入文件的
+字节数与 SHA256 在 [`THIRD-PARTY.md`](THIRD-PARTY.md)。
+
+**「Qwen」是 Alibaba Cloud 的商标**，本仓用它描述所运行的模型，不代表与其有关联或受其认可。

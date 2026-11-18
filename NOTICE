@@ -1,14 +1,129 @@
 qwen35-rust
 
-This crate reimplements inference for the Qwen3.5-0.8B model in Rust. It does not
-include or modify the model's source code; it embeds a quantised copy of the
-published weights and reads two files of the release (the tokenizer and the chat
-template) to build its own reader.
+Copyright 2026 qwen35-rust contributors
 
-The model weights, configuration, tokenizer and chat template are Apache-2.0
-licensed work of the Qwen team (Alibaba). The operator-level reading was taken
-from the Hugging Face Transformers implementation, which is also Apache-2.0.
+Licensed under the Apache License, Version 2.0. See LICENSE.
 
-Every file this build derives from is listed in THIRD-PARTY.md with its byte
-length and SHA256. Those hashes are the identity of the inputs: the local
-snapshot does not carry the upstream commit id.
+
+================================================================================
+Upstream work this repository redistributes
+================================================================================
+
+Qwen3.5-0.8B
+Copyright 2026 Alibaba Cloud
+Licensed under the Apache License, Version 2.0.
+
+The model weights, configuration, tokenizer and chat template are work of the
+Qwen team at Alibaba Cloud, published under the Apache License, Version 2.0. This
+repository redistributes derivative forms of them (see "Modifications") and
+includes a copy of the License in LICENSE. The upstream files this build was made
+from, with their byte lengths and SHA256, are listed in THIRD-PARTY.md.
+
+
+================================================================================
+Modifications
+================================================================================
+
+Apache License 2.0, section 4(b): this section records which files differ from the
+upstream model and how. All but the Unicode table derive from the model release:
+the first is distributed byte-identical to the quantised artifact it comes from,
+and the others are re-encoded or reimplemented here.
+
+src/weights/qwen3.5-0.8b-q4.qwqt
+    The model's weights in 4-bit groups with f16 scales, in the QWQT container
+    format. The bytes are identical to the quantised artifact this
+    build takes them from -- 494,845,446 bytes, SHA256
+    29773850a7ac53122e1544a24748701b55fa59ca63fed89cae71b9baabc7dfb9, the same
+    digest the input file has -- so this repository redistributes that artifact
+    rather than quantising anything. The artifact is in turn a lossy 4-bit
+    derivation of the release's bf16 safetensors (1,746,942,600 bytes), made
+    outside this repository; its generator is not part of this repository.
+
+src/tokenizer/data/tokenizer.bin
+    The vocabulary, the merge table and the added tokens, re-encoded from
+    tokenizer.json and tokenizer_config.json into a packed table: a byte table,
+    merges sorted by pair, and offset-indexed token strings. The token strings
+    and the merge pairs are the upstream ones; the layout and the indices are
+    not.
+
+src/tokenizer/data/unicode.bin
+    Character classes, combining classes and normalisation tables, derived from
+    the Unicode Character Database and from the observed behaviour of the
+    reference tokenizer. See the Unicode notice below.
+
+src/chat.rs
+    The conversation template, reimplemented in Rust from chat_template.jinja.
+    The template text itself is not copied into this repository.
+
+
+================================================================================
+Unicode
+================================================================================
+
+The character data in src/tokenizer/data/unicode.bin is derived from the Unicode
+Character Database. The license below is the Unicode License V3, reproduced in
+full; the source of the data files is https://www.unicode.org/license.txt
+
+    UNICODE LICENSE V3
+
+    COPYRIGHT AND PERMISSION NOTICE
+
+    Copyright © 1991-2023 Unicode, Inc.
+
+    NOTICE TO USER: Carefully read the following legal agreement. BY
+    DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+    SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+    TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+    DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of data files and any associated documentation (the "Data Files") or
+    software and any associated documentation (the "Software") to deal in the
+    Data Files or Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, and/or sell
+    copies of the Data Files or Software, and to permit persons to whom the
+    Data Files or Software are furnished to do so, provided that either (a)
+    this copyright and permission notice appear with all copies of the Data
+    Files or Software, or (b) this copyright and permission notice appear in
+    associated Documentation.
+
+    THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+    KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+    THIRD PARTY RIGHTS.
+
+    IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+    BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+    OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+    WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+    FILES OR SOFTWARE.
+
+    Except as contained in this notice, the name of a copyright holder shall
+    not be used in advertising or otherwise to promote the sale, use or other
+    dealings in these Data Files or Software without prior written
+    authorization of the copyright holder.
+
+
+================================================================================
+Reference implementations, read but not distributed
+================================================================================
+
+docs/op-spec.md records what each operator computes, read from the model's own
+modelling code in Hugging Face Transformers (Copyright Hugging Face, Apache
+License 2.0) and from the Qwen release's configuration files. The wiring of the
+multi-token-prediction head was read from vLLM (Copyright vLLM contributors,
+Apache License 2.0) at the commit named in docs/op-spec.md. No source file from
+either is included in this repository, and the Rust implementation is written
+against docs/op-spec.md rather than translated from them.
+
+
+================================================================================
+Trademarks
+================================================================================
+
+Apache License 2.0, section 6: the License grants no rights to the licensors'
+trade names, trademarks, service marks or product names. "Qwen" is a trademark of
+Alibaba Cloud. This project is an independent implementation, not endorsed by or
+affiliated with Alibaba Cloud; the name is used only to describe the model the
+code runs.
