@@ -29,7 +29,19 @@ fn main() {
         }
     }
     if threads > 0 {
-        parallel::set_threads(threads);
+        // A benchmark owns the machine; the library's default budget leaves cores
+        // for a host and runs the workers below normal priority.
+        parallel::set_budget(parallel::Budget {
+            threads,
+            reserve: 0,
+            priority: parallel::Priority::Normal,
+        });
+    } else {
+        parallel::set_budget(parallel::Budget {
+            reserve: 0,
+            priority: parallel::Priority::Normal,
+            ..parallel::Budget::default()
+        });
     }
 
     let ids = tokenizer().encode(&prompt);

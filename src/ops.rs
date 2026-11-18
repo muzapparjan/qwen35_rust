@@ -12,6 +12,9 @@
 //! order of operations is part of each function's contract: the port is compared
 //! against a reference that sums in a particular order.
 
+/// The kernels ask [`crate::cpu`] for the instruction sets they are allowed to
+/// use; a target with none of them compiles the question out.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::cpu;
 
 /// Values packed into one storage unit (a byte, or a three-byte group for
@@ -36,6 +39,10 @@ fn unit_bytes(bits: u8) -> usize {
 }
 
 /// The largest magnitude a value can carry, before the sign.
+///
+/// Only the vector expansion uses it: the scalar path subtracts the offset
+/// directly.
+#[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), allow(dead_code))]
 fn magnitude(bits: u8) -> i32 {
     (1 << (bits - 1)) - 1
 }
@@ -117,6 +124,13 @@ pub fn dequantize(bits: u8, group: usize, scales: &[u8], integers: &[u8], out: &
     if cpu::features().avx2_fma && bits != 2 && bits != 3 {
         // SAFETY: the feature test above established AVX2 and FMA support.
         unsafe { dequantize_avx2(bits, group, scales, integers, out) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if cpu::features().neon && bits != 2 && bits != 3 {
+        // SAFETY: the feature test above established NEON support, and `check`
+        // has already validated the arguments.
+        unsafe { neon::dequantize(bits, group, scales, integers, out) };
         return;
     }
     dequantize_scalar(bits, group, scales, integers, out);
@@ -241,6 +255,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     if crate::cpu::features().avx2_fma && a.len() >= 32 {
         // SAFETY: the feature test above established AVX2 and FMA support.
         return unsafe { dot_avx2(a, b) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::cpu::features().neon && a.len() >= 32 {
+        // SAFETY: the feature test above, and `assert_eq!` has established that
+        // both slices are the same length.
+        return unsafe { neon::dot(a, b) };
     }
     dot_scalar(a, b)
 }
@@ -386,8 +406,12 @@ pub fn linear(
             // One token: nothing to reuse a slab for, so the values are unpacked
             // straight into the products.
             let source = &x[..columns];
-            let vectorised =
-                crate::cpu::features().avx2_fma && group % 32 == 0 && columns % 2 == 0;
+            let features = crate::cpu::features();
+            // Each kernel unpacks a whole number of values per round, so a group
+            // that is not a multiple of that round falls back to the scalar
+            // kernel rather than leaving a tail unread.
+            let vectorised = (features.avx2_fma && group % 32 == 0 && columns % 2 == 0)
+                || (features.neon && group % 16 == 0 && columns % 2 == 0);
             let dot_rows = |target: &mut [f32], first: usize| {
                 for (offset, slot) in target.iter_mut().enumerate() {
                     let output = first + offset;
@@ -618,6 +642,13 @@ fn accumulate_slab(row: &[f32], x: &[f32], stride: usize, offset: usize, results
         unsafe { accumulate_slab_avx2(row, x, stride, offset, results) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::cpu::features().neon && row.len() >= 32 {
+        // SAFETY: the feature test above established NEON support; the caller
+        // has already checked that `x` holds one row per result.
+        unsafe { neon::accumulate_slab(row, x, stride, offset, results) };
+        return;
+    }
     for (token, slot) in results.iter_mut().enumerate() {
         let base = token * stride + offset;
         *slot += dot(row, &x[base..base + row.len()]);
@@ -753,6 +784,13 @@ fn accumulate_slab_pair(
         unsafe { accumulate_slab_pair_avx2(row0, row1, x, stride, offset, results) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::cpu::features().neon && row0.len() >= 32 {
+        // SAFETY: the feature test above established NEON support; `results`
+        // holds two runs by the assertion above.
+        unsafe { neon::accumulate_slab_pair(row0, row1, x, stride, offset, results) };
+        return;
+    }
     for token in 0..tokens {
         let base = token * stride + offset;
         results[token] += dot(row0, &x[base..base + row0.len()]);
@@ -874,6 +912,15 @@ fn accumulate_slab_quad(
         // SAFETY: the feature test above established AVX2 and FMA support.
         unsafe {
             accumulate_slab_quad_avx2(row0, row1, row2, row3, x, stride, offset, results)
+        };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::cpu::features().neon && row0.len() >= 32 {
+        // SAFETY: the feature test above established NEON support; `results`
+        // holds four runs by the assertion above.
+        unsafe {
+            neon::accumulate_slab_quad(row0, row1, row2, row3, x, stride, offset, results)
         };
         return;
     }
@@ -1008,6 +1055,14 @@ fn quantised_dot(
         // SAFETY: `vectorised` is only true after the AVX2/FMA test.
         return unsafe {
             quantised_dot_avx2(integers, scales, source, scale_base, integer_base, group, groups)
+        };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if vectorised {
+        // SAFETY: `vectorised` is only true after the NEON test and the group
+        // size check that test includes.
+        return unsafe {
+            neon::quantised_dot(integers, scales, source, scale_base, integer_base, group, groups)
         };
     }
     let _ = vectorised;
@@ -1267,6 +1322,501 @@ pub fn apply_rope(vector: &mut [f32], rotary: usize, cos: &[f32], sin: &[f32]) {
     }
 }
 
+/// Advanced SIMD kernels for 64-bit ARM.
+///
+/// Four `f32` lanes per register instead of eight, and a fused multiply-add, so
+/// the shapes mirror the AVX2 kernels with half the width: the same association
+/// order per token, the same split of a group into independent halves, and the
+/// same exactness properties.
+///
+/// 32-bit ARM has no path here. NEON is optional before ARMv8, and the kernels
+/// would have to fit sixteen registers rather than thirty-two, which is a
+/// different layout rather than the same one with narrower vectors.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    use core::arch::aarch64::*;
+
+    /// Store sixteen scaled values: `(byte - offset) * factor`.
+    ///
+    /// # Safety
+    /// `target` must have room for sixteen `f32` values.
+    #[inline]
+    unsafe fn store_scaled(
+        values: uint8x16_t,
+        target: *mut f32,
+        offset: float32x4_t,
+        factor: float32x4_t,
+    ) {
+        // SAFETY: the widening and narrowing helpers below take and return
+        // register values only; the single store writes four lanes at a time
+        // into the sixteen the caller reserved.
+        unsafe {
+            let low = vmovl_u8(vget_low_u8(values));
+            let high = vmovl_u8(vget_high_u8(values));
+            let quarters = [
+                vmovl_u16(vget_low_u16(low)),
+                vmovl_u16(vget_high_u16(low)),
+                vmovl_u16(vget_low_u16(high)),
+                vmovl_u16(vget_high_u16(high)),
+            ];
+            for (index, quarter) in quarters.into_iter().enumerate() {
+                let value = vmulq_f32(vsubq_f32(vcvtq_f32_u32(quarter), offset), factor);
+                vst1q_f32(target.add(4 * index), value);
+            }
+        }
+    }
+
+    /// Expand grouped symmetric quantisation into `out`.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support and checked the arguments
+    /// with [`super::check`].
+    pub unsafe fn dequantize(bits: u8, group: usize, scales: &[u8], integers: &[u8], out: &mut [f32]) {
+        let groups = out.len() / group;
+        let bytes_per_group = group * bits as usize / 8;
+        for index in 0..groups {
+            let scale = super::scale_of(scales, index);
+            let source = &integers[index * bytes_per_group..(index + 1) * bytes_per_group];
+            let target = &mut out[index * group..(index + 1) * group];
+            // SAFETY: every load reads sixteen bytes the guard below shows are
+            // inside `source`, and every store writes the sixteen values those
+            // bytes decode to, which are inside `target`.
+            unsafe {
+                let factor = vdupq_n_f32(scale);
+                match bits {
+                    8 => {
+                        let offset = vdupq_n_f32(128.0);
+                        let mut byte = 0;
+                        while byte + 16 <= source.len() {
+                            let raw = vld1q_u8(source.as_ptr().add(byte));
+                            store_scaled(raw, target.as_mut_ptr().add(byte), offset, factor);
+                            byte += 16;
+                        }
+                        for tail in byte..source.len() {
+                            target[tail] = f32::from(i16::from(source[tail]) - 128) * scale;
+                        }
+                    }
+                    4 => {
+                        let mask = vdupq_n_u8(0x0f);
+                        let offset = vdupq_n_f32(8.0);
+                        let mut byte = 0;
+                        while byte + 16 <= source.len() {
+                            let raw = vld1q_u8(source.as_ptr().add(byte));
+                            let low = vandq_u8(raw, mask);
+                            // A byte's high nibble; the mask keeps the shifted
+                            // bits from leaking across lanes.
+                            let high = vshrq_n_u8::<4>(raw);
+                            let first = vzip1q_u8(low, high);
+                            let second = vzip2q_u8(low, high);
+                            store_scaled(first, target.as_mut_ptr().add(2 * byte), offset, factor);
+                            store_scaled(
+                                second,
+                                target.as_mut_ptr().add(2 * byte + 16),
+                                offset,
+                                factor,
+                            );
+                            byte += 16;
+                        }
+                        if byte < source.len() {
+                            super::unpack_group(4, &source[byte..], &mut target[2 * byte..], scale);
+                        }
+                    }
+                    other => panic!("no vector path for {other}-bit values"),
+                }
+            }
+        }
+    }
+
+    /// `sum_i a[i] * b[i]`, four accumulator chains.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support; both slices have the same
+    /// length.
+    pub unsafe fn dot(a: &[f32], b: &[f32]) -> f32 {
+        const LANES: usize = 4;
+        let vectorised = a.len() / LANES * LANES;
+        // SAFETY: the loops stay inside `vectorised`, a whole number of
+        // four-element vectors within both slices; the tail is indexed with
+        // bounds checks.
+        unsafe {
+            let mut acc0 = vdupq_n_f32(0.0);
+            let mut acc1 = vdupq_n_f32(0.0);
+            let mut acc2 = vdupq_n_f32(0.0);
+            let mut acc3 = vdupq_n_f32(0.0);
+            let mut index = 0;
+            while index + 4 * LANES <= vectorised {
+                acc0 = vfmaq_f32(
+                    acc0,
+                    vld1q_f32(a.as_ptr().add(index)),
+                    vld1q_f32(b.as_ptr().add(index)),
+                );
+                acc1 = vfmaq_f32(
+                    acc1,
+                    vld1q_f32(a.as_ptr().add(index + LANES)),
+                    vld1q_f32(b.as_ptr().add(index + LANES)),
+                );
+                acc2 = vfmaq_f32(
+                    acc2,
+                    vld1q_f32(a.as_ptr().add(index + 2 * LANES)),
+                    vld1q_f32(b.as_ptr().add(index + 2 * LANES)),
+                );
+                acc3 = vfmaq_f32(
+                    acc3,
+                    vld1q_f32(a.as_ptr().add(index + 3 * LANES)),
+                    vld1q_f32(b.as_ptr().add(index + 3 * LANES)),
+                );
+                index += 4 * LANES;
+            }
+            while index < vectorised {
+                acc0 = vfmaq_f32(
+                    acc0,
+                    vld1q_f32(a.as_ptr().add(index)),
+                    vld1q_f32(b.as_ptr().add(index)),
+                );
+                index += LANES;
+            }
+            let mut total =
+                vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
+            for tail in vectorised..a.len() {
+                total += *a.get_unchecked(tail) * *b.get_unchecked(tail);
+            }
+            total
+        }
+    }
+
+    /// One output row of a four-bit matrix-vector product, unpacked in registers.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support and checked that
+    /// `group % 16 == 0`.
+    pub unsafe fn quantised_dot(
+        integers: &[u8],
+        scales: &[u8],
+        source: &[f32],
+        scale_base: usize,
+        integer_base: usize,
+        group: usize,
+        groups: usize,
+    ) -> f32 {
+        let bytes_per_group = group / 2;
+        let mut total = 0.0f32;
+        // SAFETY: each round reads eight bytes of the group and the sixteen
+        // values they decode to, both of which the caller's group length covers.
+        unsafe {
+            let eight = vdupq_n_f32(8.0);
+            let mask = vdup_n_u8(0x0f);
+            for group_index in 0..groups {
+                let scale = super::scale_of(scales, scale_base + group_index);
+                let base = integers.as_ptr().add(integer_base + group_index * bytes_per_group);
+                let values = source.as_ptr().add(group_index * group);
+                let mut acc0 = vdupq_n_f32(0.0);
+                let mut acc1 = vdupq_n_f32(0.0);
+                let mut acc2 = vdupq_n_f32(0.0);
+                let mut acc3 = vdupq_n_f32(0.0);
+                let mut byte = 0;
+                while byte + 8 <= bytes_per_group {
+                    let raw = vld1_u8(base.add(byte));
+                    let low = vand_u8(raw, mask);
+                    let high = vshr_n_u8::<4>(raw);
+                    // Interleaving the two nibbles puts each byte's two values
+                    // next to each other, which is the order the values are
+                    // stored in. A 64-bit vector holds eight values, so the pair
+                    // of nibble vectors splits into two halves.
+                    let first = vzip1_u8(low, high);
+                    let second = vzip2_u8(low, high);
+                    let first_wide = vmovl_u8(first);
+                    let second_wide = vmovl_u8(second);
+                    let quarters = [
+                        vmovl_u16(vget_low_u16(first_wide)),
+                        vmovl_u16(vget_high_u16(first_wide)),
+                        vmovl_u16(vget_low_u16(second_wide)),
+                        vmovl_u16(vget_high_u16(second_wide)),
+                    ];
+                    acc0 = vfmaq_f32(
+                        acc0,
+                        vsubq_f32(vcvtq_f32_u32(quarters[0]), eight),
+                        vld1q_f32(values.add(2 * byte)),
+                    );
+                    acc1 = vfmaq_f32(
+                        acc1,
+                        vsubq_f32(vcvtq_f32_u32(quarters[1]), eight),
+                        vld1q_f32(values.add(2 * byte + 4)),
+                    );
+                    acc2 = vfmaq_f32(
+                        acc2,
+                        vsubq_f32(vcvtq_f32_u32(quarters[2]), eight),
+                        vld1q_f32(values.add(2 * byte + 8)),
+                    );
+                    acc3 = vfmaq_f32(
+                        acc3,
+                        vsubq_f32(vcvtq_f32_u32(quarters[3]), eight),
+                        vld1q_f32(values.add(2 * byte + 12)),
+                    );
+                    byte += 8;
+                }
+                total += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)))
+                    * scale;
+            }
+        }
+        total
+    }
+
+    /// Add `row · x[token, slab]` into `results` for every token, four at a time.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support; `x` must hold
+    /// `results.len()` rows of `stride` values, each at least `offset + row.len()`
+    /// long.
+    pub unsafe fn accumulate_slab(
+        row: &[f32],
+        x: &[f32],
+        stride: usize,
+        offset: usize,
+        results: &mut [f32],
+    ) {
+        const LANES: usize = 4;
+        let columns = row.len();
+        let vectorised = columns / LANES * LANES;
+        let tokens = results.len();
+        let base = row.as_ptr();
+        let mut token = 0;
+        // SAFETY: the token rows start inside `x`, and every load below stays
+        // inside `vectorised <= columns` of the row and of each token's row.
+        unsafe {
+            while token + 4 <= tokens {
+                let first = x.as_ptr().add(token * stride + offset);
+                let second = first.add(stride);
+                let third = first.add(2 * stride);
+                let fourth = first.add(3 * stride);
+                let mut low0 = vdupq_n_f32(0.0);
+                let mut low1 = vdupq_n_f32(0.0);
+                let mut low2 = vdupq_n_f32(0.0);
+                let mut low3 = vdupq_n_f32(0.0);
+                let mut high0 = vdupq_n_f32(0.0);
+                let mut high1 = vdupq_n_f32(0.0);
+                let mut high2 = vdupq_n_f32(0.0);
+                let mut high3 = vdupq_n_f32(0.0);
+                let mut index = 0;
+                while index + 2 * LANES <= vectorised {
+                    let weight0 = vld1q_f32(base.add(index));
+                    let weight1 = vld1q_f32(base.add(index + LANES));
+                    low0 = vfmaq_f32(low0, weight0, vld1q_f32(first.add(index)));
+                    high0 = vfmaq_f32(high0, weight1, vld1q_f32(first.add(index + LANES)));
+                    low1 = vfmaq_f32(low1, weight0, vld1q_f32(second.add(index)));
+                    high1 = vfmaq_f32(high1, weight1, vld1q_f32(second.add(index + LANES)));
+                    low2 = vfmaq_f32(low2, weight0, vld1q_f32(third.add(index)));
+                    high2 = vfmaq_f32(high2, weight1, vld1q_f32(third.add(index + LANES)));
+                    low3 = vfmaq_f32(low3, weight0, vld1q_f32(fourth.add(index)));
+                    high3 = vfmaq_f32(high3, weight1, vld1q_f32(fourth.add(index + LANES)));
+                    index += 2 * LANES;
+                }
+                if index < vectorised {
+                    let weight = vld1q_f32(base.add(index));
+                    low0 = vfmaq_f32(low0, weight, vld1q_f32(first.add(index)));
+                    low1 = vfmaq_f32(low1, weight, vld1q_f32(second.add(index)));
+                    low2 = vfmaq_f32(low2, weight, vld1q_f32(third.add(index)));
+                    low3 = vfmaq_f32(low3, weight, vld1q_f32(fourth.add(index)));
+                    index += LANES;
+                }
+                results[token] += vaddvq_f32(vaddq_f32(low0, high0));
+                results[token + 1] += vaddvq_f32(vaddq_f32(low1, high1));
+                results[token + 2] += vaddvq_f32(vaddq_f32(low2, high2));
+                results[token + 3] += vaddvq_f32(vaddq_f32(low3, high3));
+                for tail in index..columns {
+                    let weight = *base.add(tail);
+                    results[token] += weight * *first.add(tail);
+                    results[token + 1] += weight * *second.add(tail);
+                    results[token + 2] += weight * *third.add(tail);
+                    results[token + 3] += weight * *fourth.add(tail);
+                }
+                token += 4;
+            }
+            // Whatever is left has no quartet to fill; `dot` sums in the same
+            // order, so those tokens still get the same bits.
+            while token < tokens {
+                let start = token * stride + offset;
+                results[token] += dot(row, &x[start..start + columns]);
+                token += 1;
+            }
+        }
+    }
+
+    /// Two rows' slabs against every token, four tokens per pass.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support, and `results` must hold
+    /// two runs of one value per token.
+    pub unsafe fn accumulate_slab_pair(
+        row0: &[f32],
+        row1: &[f32],
+        x: &[f32],
+        stride: usize,
+        offset: usize,
+        results: &mut [f32],
+    ) {
+        const LANES: usize = 4;
+        let columns = row0.len();
+        let vectorised = columns / LANES * LANES;
+        let tokens = results.len() / 2;
+        let base0 = row0.as_ptr();
+        let base1 = row1.as_ptr();
+        let mut token = 0;
+        // SAFETY: the token rows start inside `x`; every load stays inside
+        // `vectorised <= columns` of both rows and of each token's row.
+        unsafe {
+            while token + 4 <= tokens {
+                let first = x.as_ptr().add(token * stride + offset);
+                let second = first.add(stride);
+                let third = first.add(2 * stride);
+                let fourth = first.add(3 * stride);
+                let mut a0 = vdupq_n_f32(0.0);
+                let mut a1 = vdupq_n_f32(0.0);
+                let mut a2 = vdupq_n_f32(0.0);
+                let mut a3 = vdupq_n_f32(0.0);
+                let mut b0 = vdupq_n_f32(0.0);
+                let mut b1 = vdupq_n_f32(0.0);
+                let mut b2 = vdupq_n_f32(0.0);
+                let mut b3 = vdupq_n_f32(0.0);
+                let mut index = 0;
+                while index < vectorised {
+                    let weight0 = vld1q_f32(base0.add(index));
+                    let weight1 = vld1q_f32(base1.add(index));
+                    let input0 = vld1q_f32(first.add(index));
+                    let input1 = vld1q_f32(second.add(index));
+                    let input2 = vld1q_f32(third.add(index));
+                    let input3 = vld1q_f32(fourth.add(index));
+                    a0 = vfmaq_f32(a0, weight0, input0);
+                    b0 = vfmaq_f32(b0, weight1, input0);
+                    a1 = vfmaq_f32(a1, weight0, input1);
+                    b1 = vfmaq_f32(b1, weight1, input1);
+                    a2 = vfmaq_f32(a2, weight0, input2);
+                    b2 = vfmaq_f32(b2, weight1, input2);
+                    a3 = vfmaq_f32(a3, weight0, input3);
+                    b3 = vfmaq_f32(b3, weight1, input3);
+                    index += LANES;
+                }
+                results[token] += vaddvq_f32(a0);
+                results[token + 1] += vaddvq_f32(a1);
+                results[token + 2] += vaddvq_f32(a2);
+                results[token + 3] += vaddvq_f32(a3);
+                results[tokens + token] += vaddvq_f32(b0);
+                results[tokens + token + 1] += vaddvq_f32(b1);
+                results[tokens + token + 2] += vaddvq_f32(b2);
+                results[tokens + token + 3] += vaddvq_f32(b3);
+                for tail in index..columns {
+                    let weight0 = *base0.add(tail);
+                    let weight1 = *base1.add(tail);
+                    results[token] += weight0 * *first.add(tail);
+                    results[token + 1] += weight0 * *second.add(tail);
+                    results[token + 2] += weight0 * *third.add(tail);
+                    results[token + 3] += weight0 * *fourth.add(tail);
+                    results[tokens + token] += weight1 * *first.add(tail);
+                    results[tokens + token + 1] += weight1 * *second.add(tail);
+                    results[tokens + token + 2] += weight1 * *third.add(tail);
+                    results[tokens + token + 3] += weight1 * *fourth.add(tail);
+                }
+                token += 4;
+            }
+            while token < tokens {
+                let start = token * stride + offset;
+                results[token] += dot(row0, &x[start..start + columns]);
+                results[tokens + token] += dot(row1, &x[start..start + columns]);
+                token += 1;
+            }
+        }
+    }
+
+    /// Four rows' slabs against every token, two tokens per pass.
+    ///
+    /// # Safety
+    /// The caller must have established NEON support, and `results` must hold
+    /// four runs of one value per token.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn accumulate_slab_quad(
+        row0: &[f32],
+        row1: &[f32],
+        row2: &[f32],
+        row3: &[f32],
+        x: &[f32],
+        stride: usize,
+        offset: usize,
+        results: &mut [f32],
+    ) {
+        const LANES: usize = 4;
+        let columns = row0.len();
+        let vectorised = columns / LANES * LANES;
+        let tokens = results.len() / 4;
+        let base0 = row0.as_ptr();
+        let base1 = row1.as_ptr();
+        let base2 = row2.as_ptr();
+        let base3 = row3.as_ptr();
+        let mut token = 0;
+        // SAFETY: the token rows start inside `x`; every load stays inside
+        // `vectorised <= columns` of each row.
+        unsafe {
+            while token + 2 <= tokens {
+                let first = x.as_ptr().add(token * stride + offset);
+                let second = first.add(stride);
+                let mut a0 = vdupq_n_f32(0.0);
+                let mut a1 = vdupq_n_f32(0.0);
+                let mut b0 = vdupq_n_f32(0.0);
+                let mut b1 = vdupq_n_f32(0.0);
+                let mut c0 = vdupq_n_f32(0.0);
+                let mut c1 = vdupq_n_f32(0.0);
+                let mut d0 = vdupq_n_f32(0.0);
+                let mut d1 = vdupq_n_f32(0.0);
+                let mut index = 0;
+                while index < vectorised {
+                    let input0 = vld1q_f32(first.add(index));
+                    let input1 = vld1q_f32(second.add(index));
+                    let weight0 = vld1q_f32(base0.add(index));
+                    let weight1 = vld1q_f32(base1.add(index));
+                    let weight2 = vld1q_f32(base2.add(index));
+                    let weight3 = vld1q_f32(base3.add(index));
+                    a0 = vfmaq_f32(a0, weight0, input0);
+                    a1 = vfmaq_f32(a1, weight0, input1);
+                    b0 = vfmaq_f32(b0, weight1, input0);
+                    b1 = vfmaq_f32(b1, weight1, input1);
+                    c0 = vfmaq_f32(c0, weight2, input0);
+                    c1 = vfmaq_f32(c1, weight2, input1);
+                    d0 = vfmaq_f32(d0, weight3, input0);
+                    d1 = vfmaq_f32(d1, weight3, input1);
+                    index += LANES;
+                }
+                results[token] += vaddvq_f32(a0);
+                results[token + 1] += vaddvq_f32(a1);
+                results[tokens + token] += vaddvq_f32(b0);
+                results[tokens + token + 1] += vaddvq_f32(b1);
+                results[2 * tokens + token] += vaddvq_f32(c0);
+                results[2 * tokens + token + 1] += vaddvq_f32(c1);
+                results[3 * tokens + token] += vaddvq_f32(d0);
+                results[3 * tokens + token + 1] += vaddvq_f32(d1);
+                for tail in index..columns {
+                    let input0 = *first.add(tail);
+                    let input1 = *second.add(tail);
+                    results[token] += *base0.add(tail) * input0;
+                    results[token + 1] += *base0.add(tail) * input1;
+                    results[tokens + token] += *base1.add(tail) * input0;
+                    results[tokens + token + 1] += *base1.add(tail) * input1;
+                    results[2 * tokens + token] += *base2.add(tail) * input0;
+                    results[2 * tokens + token + 1] += *base2.add(tail) * input1;
+                    results[3 * tokens + token] += *base3.add(tail) * input0;
+                    results[3 * tokens + token + 1] += *base3.add(tail) * input1;
+                }
+                token += 2;
+            }
+            while token < tokens {
+                let start = token * stride + offset;
+                results[token] += dot(row0, &x[start..start + columns]);
+                results[tokens + token] += dot(row1, &x[start..start + columns]);
+                results[2 * tokens + token] += dot(row2, &x[start..start + columns]);
+                results[3 * tokens + token] += dot(row3, &x[start..start + columns]);
+                token += 1;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1378,6 +1928,127 @@ mod tests {
         dequantize(4, 32, &scale, &integers, &mut fast);
         for (a, b) in slow.iter().zip(&fast) {
             assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+        }
+    }
+
+    /// Expansion is exact, so the two paths must agree bit for bit — including
+    /// over a buffer long enough to run the sixteen-byte rounds more than once.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_expansion_is_bit_exact() {
+        let patterns = scales(&[0.0625, 1.5, 0.25, 2.0, 0.5, 0.125, 1.0, 3.0]);
+        // Four-bit: 256 values in eight groups of 32, so 64 bytes and four
+        // rounds of sixteen.
+        let integers: Vec<u8> = (0..64u32).map(|index| (index * 37 % 256) as u8).collect();
+        let mut slow = [0.0f32; 256];
+        let mut fast = [0.0f32; 256];
+        dequantize_scalar(4, 32, &patterns, &integers, &mut slow);
+        dequantize(4, 32, &patterns, &integers, &mut fast);
+        for (a, b) in slow.iter().zip(&fast) {
+            assert_eq!(a.to_bits(), b.to_bits(), "four-bit: {a} vs {b}");
+        }
+
+        // Eight-bit: two groups of 32 values, 64 bytes of payload.
+        let integers: Vec<u8> = (0..64u32).map(|index| (index * 53 % 256) as u8).collect();
+        dequantize_scalar(8, 32, &patterns, &integers, &mut slow);
+        dequantize(8, 32, &patterns, &integers, &mut fast);
+        for (a, b) in slow.iter().zip(&fast) {
+            assert_eq!(a.to_bits(), b.to_bits(), "eight-bit: {a} vs {b}");
+        }
+    }
+
+    /// A reduction has an association order, so the two paths agree to within
+    /// the error of summing the same terms in a different order.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_dot_matches_the_portable_one() {
+        for length in [32usize, 33, 64, 129, 1024] {
+            let left: Vec<f32> = (0..length).map(|index| (index as f32 * 0.37).sin()).collect();
+            let right: Vec<f32> = (0..length).map(|index| (index as f32 * 0.11).cos()).collect();
+            let slow = dot_scalar(&left, &right);
+            let fast = dot(&left, &right);
+            let tolerance = 1e-5 * slow.abs().max(1.0);
+            assert!(
+                (slow - fast).abs() <= tolerance,
+                "{length} values: {slow} vs {fast}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_quantised_dot_matches_the_portable_one() {
+        let columns = 64;
+        let group = 32;
+        let groups = columns / group;
+        let integers: Vec<u8> = (0..columns / 2)
+            .map(|index| (index * 37 % 256) as u8)
+            .collect();
+        let scale = scales(&[0.03125, 0.5]);
+        let source: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.23).sin()).collect();
+        let slow = quantised_dot(&integers, &scale, &source, 0, columns, group, groups, false);
+        let fast = quantised_dot(&integers, &scale, &source, 0, columns, group, groups, true);
+        let tolerance = 1e-5 * slow.abs().max(1.0);
+        assert!((slow - fast).abs() <= tolerance, "{slow} vs {fast}");
+    }
+
+    /// The batch kernels split a batch into a four-token run and a remainder of
+    /// one to three tokens, so a length that is not a multiple of four exercises
+    /// both halves of the same call.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_slab_kernels_match_the_portable_ones() {
+        let columns = 68; // not a multiple of the four-lane vectors either
+        let tokens = 7;
+        let stride = columns;
+        let row: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.37).sin()).collect();
+        let x: Vec<f32> = (0..tokens * stride)
+            .map(|index| (index as f32 * 0.11).cos())
+            .collect();
+        let close = |slow: f32, fast: f32| (slow - fast).abs() <= 1e-5 * slow.abs().max(1.0);
+
+        // One row.
+        let mut slow = vec![0.0f32; tokens];
+        let mut fast = vec![0.0f32; tokens];
+        for token in 0..tokens {
+            let base = token * stride;
+            slow[token] += dot_scalar(&row, &x[base..base + columns]);
+        }
+        accumulate_slab(&row, &x, stride, 0, &mut fast);
+        for token in 0..tokens {
+            assert!(close(slow[token], fast[token]), "one row, token {token}");
+        }
+
+        // Two rows, each with a run of its own.
+        let second: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.53).sin()).collect();
+        let mut slow = vec![0.0f32; 2 * tokens];
+        let mut fast = vec![0.0f32; 2 * tokens];
+        for token in 0..tokens {
+            let base = token * stride;
+            slow[token] += dot_scalar(&row, &x[base..base + columns]);
+            slow[tokens + token] += dot_scalar(&second, &x[base..base + columns]);
+        }
+        accumulate_slab_pair(&row, &second, &x, stride, 0, &mut fast);
+        for index in 0..2 * tokens {
+            assert!(close(slow[index], fast[index]), "pair, index {index}");
+        }
+
+        // Four rows against two tokens at a time, so an odd batch also lands in
+        // the single-token remainder.
+        let third: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.71).sin()).collect();
+        let fourth: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.91).cos()).collect();
+        let mut slow = vec![0.0f32; 4 * tokens];
+        let mut fast = vec![0.0f32; 4 * tokens];
+        for token in 0..tokens {
+            let base = token * stride;
+            slow[token] += dot_scalar(&row, &x[base..base + columns]);
+            slow[tokens + token] += dot_scalar(&second, &x[base..base + columns]);
+            slow[2 * tokens + token] += dot_scalar(&third, &x[base..base + columns]);
+            slow[3 * tokens + token] += dot_scalar(&fourth, &x[base..base + columns]);
+        }
+        accumulate_slab_quad(&row, &second, &third, &fourth, &x, stride, 0, &mut fast);
+        for index in 0..4 * tokens {
+            assert!(close(slow[index], fast[index]), "quad, index {index}");
         }
     }
 }

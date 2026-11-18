@@ -11,7 +11,7 @@
 //! that keeps the borrow alive: [`Pool::parallel_for`] does not return until every
 //! worker has finished the generation it published.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 type Job = dyn Fn(usize) + Sync + 'static;
@@ -240,6 +240,7 @@ impl Drop for Pool {
 
 fn worker(shared: Arc<Shared>, index: usize) {
     let mut seen = 0u64;
+    let mut applied = apply_priority(DESIRED_PRIORITY.load(Ordering::SeqCst));
     loop {
         // Fast path: spin until the epoch moves.
         let mut spins = 0;
@@ -268,6 +269,12 @@ fn worker(shared: Arc<Shared>, index: usize) {
             (inner.generation, inner.parts, inner.workers, inner.job)
         };
         if generation != seen {
+            // The host may have asked for a different priority since the last
+            // job; the comparison is free against a job that is about to run.
+            let desired = DESIRED_PRIORITY.load(Ordering::SeqCst);
+            if desired != applied {
+                applied = apply_priority(desired);
+            }
             if let Some(pointer) = pointer {
                 // SAFETY: the publisher waits for `remaining` to reach zero, so
                 // the borrowed data is still alive; this worker decrements below
@@ -303,16 +310,132 @@ fn worker(shared: Arc<Shared>, index: usize) {
 /// The count is capped rather than left at the core count: past this point the
 /// batch kernels gain about a tenth while the single-token kernel loses about a
 /// third, the workers having started to fight over the same caches.
-/// [`set_threads`] overrides it, which is how `examples/bench.rs` sweeps the
-/// value.
 const MAX_WORKERS: usize = 16;
 
-static REQUESTED: AtomicUsize = AtomicUsize::new(0);
+/// What a host wants the pool to be allowed to use.
+///
+/// A model that saturates every core at normal priority starves whatever shares
+/// the machine: a game's render loop, a UI thread, the mouse cursor. The pool
+/// therefore takes a budget rather than deciding for itself, and the default is
+/// the polite one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Worker threads. `0` asks for a count derived from the machine and
+    /// `reserve`; anything else is used as given, up to a fixed cap.
+    pub threads: usize,
+    /// Cores to leave for the host when `threads` is `0`. Two is enough for a
+    /// render loop and its audio thread.
+    pub reserve: usize,
+    /// Scheduling priority of the workers.
+    pub priority: Priority,
+}
+
+/// How the workers compete with the host's own threads.
+///
+/// Each platform has a mechanism that is both below normal and reversible
+/// without a privilege, so a host can raise the workers again when it stops
+/// needing them to yield:
+///
+/// - Windows: `THREAD_PRIORITY_LOWEST`;
+/// - Linux and Android: the `SCHED_IDLE` scheduling class, which runs only when
+///   no other thread wants the core, and which an unprivileged thread is always
+///   allowed to enter and to leave;
+/// - macOS: `PRIO_DARWIN_BG` on the thread.
+///
+/// Every one of those is reversible without a privilege, so a host that asks
+/// for [`Priority::Normal`] again gets the cores back. A target with none of
+/// those mechanisms keeps its threads where the process put them; the pool
+/// reports that through [`budget`] rather than pretending the change landed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Priority {
+    /// Below every normal thread: the operating system preempts a worker the
+    /// moment any other thread wants its core, so a host stays responsive and
+    /// still gets every core that nobody else is using.
+    Background,
+    /// The default priority. Only for a tool that owns the machine, such as a
+    /// benchmark; an embedded host should not ask for this.
+    Normal,
+}
+
+impl Default for Budget {
+    fn default() -> Budget {
+        Budget {
+            threads: 0,
+            reserve: 2,
+            priority: Priority::Background,
+        }
+    }
+}
+
+impl Budget {
+    /// The worker count this budget means on a machine with `available` cores.
+    pub fn workers(&self, available: usize) -> usize {
+        let available = available.max(1);
+        if self.threads > 0 {
+            return self.threads.min(MAX_WORKERS).max(1);
+        }
+        available.saturating_sub(self.reserve).min(MAX_WORKERS).max(1)
+    }
+}
+
+/// The budget the pool will be built with, and the one its workers follow.
+static BUDGET: Mutex<Budget> = Mutex::new(Budget {
+    threads: 0,
+    reserve: 2,
+    priority: Priority::Background,
+});
+
+/// The priority the workers should be running at, read without the mutex.
+static DESIRED_PRIORITY: AtomicI32 = AtomicI32::new(BACKGROUND_CODE);
+
 static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
 
-/// Ask for a worker count; 0 means "choose one". Ignored once the pool exists.
+/// Set what the pool may use. Call before the first [`pool`] access.
+///
+/// The priority may be changed at any time; the thread count may not, because a
+/// pool cannot grow or shrink, and silently ignoring the request would leave the
+/// caller believing the machine is quieter than it is. Changing the count after
+/// the pool exists is therefore a programming error and panics.
+pub fn set_budget(budget: Budget) {
+    if let Some(pool) = POOL.get()
+        && budget.threads > 0
+    {
+        let count = budget.workers(available_cores());
+        assert_eq!(
+            count,
+            pool.threads(),
+            "the pool already has {} workers, so the thread count can no longer change; set the budget before the first use",
+            pool.threads()
+        );
+    }
+    DESIRED_PRIORITY.store(priority_code(budget.priority), Ordering::SeqCst);
+    *BUDGET.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = budget;
+}
+
+/// The budget in force.
+///
+/// Reading it does not create the pool.
+pub fn budget() -> Budget {
+    *BUDGET.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Run the workers at `priority` from now on.
+pub fn set_priority(priority: Priority) {
+    set_budget(Budget {
+        priority,
+        ..budget()
+    });
+}
+
+/// Ask for a worker count; `0` means "derive it from the budget".
+///
+/// A thin wrapper over [`set_budget`] for callers that only want to change the
+/// count.
 pub fn set_threads(count: usize) {
-    REQUESTED.store(count, Ordering::SeqCst);
+    set_budget(Budget {
+        threads: count,
+        ..budget()
+    });
 }
 
 /// Number of workers in the pool.
@@ -320,21 +443,170 @@ pub fn threads() -> usize {
     pool().threads()
 }
 
+fn available_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
 /// The shared pool, created on first use.
 pub fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
-        let requested = REQUESTED.load(Ordering::SeqCst);
-        let count = if requested > 0 {
-            requested
-        } else {
-            std::thread::available_parallelism()
-                .map(|count| count.get())
-                .unwrap_or(1)
-                .saturating_sub(1)
-                .min(MAX_WORKERS)
-        };
-        Pool::new(count)
+        let budget = budget();
+        DESIRED_PRIORITY.store(priority_code(budget.priority), Ordering::SeqCst);
+        Pool::new(budget.workers(available_cores()))
     })
+}
+
+/// The priority codes the pool stores and compares.
+///
+/// They are the pool's own numbering rather than a platform constant, so one
+/// atomic carries the request on every target and the platform mapping stays
+/// inside [`native`].
+const BACKGROUND_CODE: i32 = 0;
+const NORMAL_CODE: i32 = 1;
+
+/// Whether this platform can apply a priority.
+const SUPPORTED: bool = cfg!(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+));
+
+/// The pool's code for a priority.
+fn priority_code(priority: Priority) -> i32 {
+    match priority {
+        Priority::Background => BACKGROUND_CODE,
+        Priority::Normal => NORMAL_CODE,
+    }
+}
+
+/// Put the calling thread at `code`, returning the code in force afterwards.
+///
+/// A platform that refuses the change leaves the thread where it was, and the
+/// return value says so instead of claiming the request took effect.
+fn apply_priority(code: i32) -> i32 {
+    if !SUPPORTED {
+        return code;
+    }
+    if native::set(code == BACKGROUND_CODE) {
+        code
+    } else {
+        current_priority()
+    }
+}
+
+/// The priority the calling thread is running at.
+fn current_priority() -> i32 {
+    if SUPPORTED && native::is_background() {
+        BACKGROUND_CODE
+    } else {
+        NORMAL_CODE
+    }
+}
+
+/// The platform's own way of lowering a thread.
+#[cfg(windows)]
+mod native {
+    /// `THREAD_PRIORITY_LOWEST` and `THREAD_PRIORITY_NORMAL`.
+    const LOWEST: i32 = -2;
+    const NORMAL: i32 = 0;
+    /// `THREAD_PRIORITY_BELOW_NORMAL`; anything at or below this is a thread the
+    /// system prefers over.
+    const BELOW_NORMAL: i32 = -1;
+
+    pub fn set(background: bool) -> bool {
+        let level = if background { LOWEST } else { NORMAL };
+        // SAFETY: `GetCurrentThread` returns a pseudo handle for the calling
+        // thread, which is valid to pass to `SetThreadPriority` and must not be
+        // closed. Neither call can invalidate anything this thread owns.
+        unsafe { SetThreadPriority(GetCurrentThread(), level) != 0 }
+    }
+
+    pub fn is_background() -> bool {
+        // SAFETY: the same pseudo handle as `set`.
+        unsafe { GetThreadPriority(GetCurrentThread()) <= BELOW_NORMAL }
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn GetThreadPriority(handle: *mut core::ffi::c_void) -> i32;
+        fn SetThreadPriority(handle: *mut core::ffi::c_void, priority: i32) -> i32;
+    }
+}
+
+/// The platform's own way of lowering a thread.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod native {
+    const SCHED_OTHER: i32 = 0;
+    const SCHED_IDLE: i32 = 5;
+
+    /// The priority a policy takes. Both policies here ignore it and require
+    /// zero.
+    #[repr(C)]
+    struct SchedParam {
+        sched_priority: i32,
+    }
+
+    pub fn set(background: bool) -> bool {
+        let policy = if background { SCHED_IDLE } else { SCHED_OTHER };
+        let param = SchedParam { sched_priority: 0 };
+        // SAFETY: a zero pid means the calling thread, and `param` points at a
+        // live `sched_param` for the duration of the call.
+        unsafe { sched_setscheduler(0, policy, &param) == 0 }
+    }
+
+    pub fn is_background() -> bool {
+        // SAFETY: a zero pid means the calling thread.
+        unsafe { sched_getscheduler(0) == SCHED_IDLE }
+    }
+
+    unsafe extern "C" {
+        fn sched_setscheduler(pid: i32, policy: i32, param: *const SchedParam) -> i32;
+        fn sched_getscheduler(pid: i32) -> i32;
+    }
+}
+
+/// The platform's own way of lowering a thread.
+#[cfg(target_os = "macos")]
+mod native {
+    const PRIO_DARWIN_THREAD: i32 = 3;
+    const PRIO_DARWIN_BG: i32 = 0x10000;
+
+    pub fn set(background: bool) -> bool {
+        let value = if background { PRIO_DARWIN_BG } else { 0 };
+        // SAFETY: a zero id means the calling thread.
+        unsafe { setpriority(PRIO_DARWIN_THREAD, 0, value) == 0 }
+    }
+
+    pub fn is_background() -> bool {
+        // SAFETY: a zero id means the calling thread.
+        unsafe { getpriority(PRIO_DARWIN_THREAD, 0) == PRIO_DARWIN_BG }
+    }
+
+    unsafe extern "C" {
+        fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+        fn getpriority(which: i32, who: u32) -> i32;
+    }
+}
+
+/// Platforms with no mechanism here keep the thread where the process put it.
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
+mod native {
+    pub fn set(_background: bool) -> bool {
+        false
+    }
+
+    pub fn is_background() -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +650,73 @@ mod tests {
         assert!(outcome.is_err(), "the panic was swallowed");
         // The pool is still usable.
         pool.parallel_for(2, &|_| {});
+    }
+
+    #[test]
+    fn a_budget_leaves_the_reserved_cores_alone() {
+        let polite = Budget::default();
+        assert_eq!(polite.workers(24), 16, "capped, and two cores are left over");
+        assert_eq!(polite.workers(4), 2, "a small machine keeps two cores for the host");
+        assert_eq!(polite.workers(2), 1, "one core is still a worker");
+        assert_eq!(polite.workers(1), 1, "a single-core machine still runs");
+    }
+
+    #[test]
+    fn an_explicit_count_wins_over_the_reserve() {
+        let fixed = Budget {
+            threads: 4,
+            reserve: 8,
+            priority: Priority::Normal,
+        };
+        assert_eq!(fixed.workers(24), 4, "the reserve does not subtract from a fixed count");
+        assert_eq!(fixed.threads, 4);
+    }
+
+    #[test]
+    fn an_explicit_count_is_still_capped() {
+        let fixed = Budget {
+            threads: 1000,
+            ..Budget::default()
+        };
+        assert_eq!(fixed.workers(24), MAX_WORKERS);
+    }
+
+    #[test]
+    fn a_priority_change_reaches_the_workers() {
+        if !SUPPORTED {
+            return;
+        }
+        let pool = Pool::new(2);
+        let sample = || {
+            let observed = Mutex::new(Vec::new());
+            pool.parallel_for(2, &|_| {
+                observed.lock().unwrap().push(current_priority());
+            });
+            observed.into_inner().unwrap()
+        };
+
+        // Both directions: a mechanism that only lowers, or only once, would
+        // leave the pool stuck and the host unable to take the cores back.
+        set_priority(Priority::Normal);
+        let seen = sample();
+        assert!(
+            seen.iter().all(|code| *code == priority_code(Priority::Normal)),
+            "workers ran at {seen:?} after the priority was set to normal"
+        );
+
+        set_priority(Priority::Background);
+        let seen = sample();
+        assert!(
+            seen.iter().all(|code| *code == priority_code(Priority::Background)),
+            "workers ran at {seen:?} after the priority was set to background"
+        );
+
+        set_priority(Priority::Normal);
+        let seen = sample();
+        assert!(
+            seen.iter().all(|code| *code == priority_code(Priority::Normal)),
+            "workers stayed at {seen:?} after the priority was raised again"
+        );
     }
 
     #[test]

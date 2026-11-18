@@ -2,7 +2,10 @@
 name = "qwen35-rust"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# The default build needs 1.85 (edition 2024). The `wgpu` feature raises it to
+# 1.87, which is what wgpu, wgpu-core, wgpu-hal and naga each declare, and Cargo
+# has no per-feature way to say that, so the one number has to cover both.
+rust-version = "1.87"
 license = "Apache-2.0"
 description = "Qwen3.5-0.8B inference in Rust, CPU (std only) and wgpu backends"
 readme = "README.md"
@@ -18,5 +21,13 @@ force-scalar = []
 # are not part of the repository, so this is off by default: a checkout runs the
 # tests that stand on their own.
 reference-fixtures = []
+# A second backend for the same arithmetic. Off by default so the default build
+# keeps its single property: no dependencies at all.
+wgpu = ["dep:wgpu"]
 
 [dependencies]
+wgpu = { version = "30", optional = true }
+
+[[example]]
+name = "gpu_bench"
+required-features = ["wgpu"]

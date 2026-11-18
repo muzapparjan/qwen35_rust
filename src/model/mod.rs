@@ -12,6 +12,12 @@
 use crate::ops;
 use crate::weights::{self, manifest, Matrix};
 
+mod mtp;
+pub mod record;
+
+pub use mtp::Round;
+pub use record::Recorded;
+
 /// Something that records intermediate tensors.
 ///
 /// `NoTrace` is what a normal call passes: the recording is compiled in but
@@ -51,10 +57,21 @@ macro_rules! record {
     };
 }
 
+/// What a forward pass leaves behind.
+pub struct Outputs {
+    /// Logits of the last position.
+    pub logits: Vec<f32>,
+    /// The normalised hidden state of every position, `[sequence][HIDDEN_SIZE]`.
+    pub hidden: Vec<f32>,
+}
+
 /// The state a generation carries between calls: one KV pair per full-attention
 /// layer and one convolution plus recurrent state per linear one.
 pub struct Cache {
     pub attention: Vec<AttentionCache>,
+    /// The draft head's own attention cache. It is a separate layer with its own
+    /// keys and values, and it stays empty unless speculation runs.
+    pub mtp: AttentionCache,
     pub linear: Vec<LinearCache>,
     /// Tokens already processed.
     pub length: usize,
@@ -76,6 +93,7 @@ pub struct AttentionCache {
 }
 
 /// State for one linear-attention layer.
+#[derive(Clone)]
 pub struct LinearCache {
     /// The last `kernel` inputs of the causal convolution, per channel:
     /// `conv[channel * kernel + offset]`, oldest first.
@@ -88,6 +106,7 @@ impl Cache {
     pub fn new() -> Cache {
         Cache {
             attention: (0..manifest::FULL_LAYERS.len()).map(|_| AttentionCache::new()).collect(),
+            mtp: AttentionCache::new(),
             linear: (0..manifest::LINEAR_LAYERS.len()).map(|_| LinearCache::new()).collect(),
             length: 0,
             position_delta: 0,
@@ -96,7 +115,7 @@ impl Cache {
 
     /// Forget everything, as if no token had been processed.
     pub fn reset(&mut self) {
-        for cache in &mut self.attention {
+        for cache in self.attention.iter_mut().chain(std::iter::once(&mut self.mtp)) {
             for buffer in cache.keys.iter_mut().chain(cache.values.iter_mut()) {
                 buffer.clear();
             }
@@ -108,6 +127,34 @@ impl Cache {
         }
         self.length = 0;
         self.position_delta = 0;
+    }
+
+    /// The state to come back to if a speculative tail is rejected.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            length: self.length,
+            draft_positions: self.mtp.positions,
+            linear: self.linear.clone(),
+        }
+    }
+
+    /// Put the recurrent state back the way the snapshot found it, and keep the
+    /// first `drafts` entries of the draft head's cache.
+    ///
+    /// The attention lengths go back to the snapshot's, because the caller walks
+    /// the kept prefix again and that walk advances them; only the draft head's
+    /// cache is not walked, so its length is set directly.
+    pub fn rollback(&mut self, snapshot: &Snapshot, drafts: usize) {
+        assert!(
+            snapshot.length <= self.length,
+            "a rollback cannot lengthen the cache"
+        );
+        self.linear.clone_from(&snapshot.linear);
+        self.length = snapshot.length;
+        for cache in self.attention.iter_mut() {
+            cache.positions = snapshot.length;
+        }
+        self.mtp.positions = snapshot.draft_positions + drafts;
     }
 }
 
@@ -145,6 +192,27 @@ impl LinearCache {
     }
 }
 
+/// The cache state a rejected speculation has to put back.
+///
+/// The attention caches need no data copied: a write always lands at
+/// `past + token`, so entries past the new end are overwritten rather than read.
+/// A linear-attention layer has no such address — every token multiplies its
+/// recurrent state in place, and that product cannot be undone — so its state is
+/// copied here and the kept prefix is walked again.
+#[derive(Clone)]
+pub struct Snapshot {
+    length: usize,
+    draft_positions: usize,
+    linear: Vec<LinearCache>,
+}
+
+impl Snapshot {
+    /// The token count the snapshot was taken at.
+    pub fn length(&self) -> usize {
+        self.length
+    }
+}
+
 /// The model. The weights are embedded, so this holds nothing.
 pub struct Model;
 
@@ -159,16 +227,29 @@ fn embedding_matrix() -> Matrix {
     weights::expect("model.language_model.embed_tokens.weight").matrix()
 }
 
-fn prefix(layer: usize, suffix: &str) -> String {
-    format!("model.language_model.layers.{layer}.{suffix}")
+/// The name a text layer's weights hang under.
+fn layer_base(layer: usize) -> String {
+    format!("model.language_model.layers.{layer}")
+}
+
+/// A weight of the layer whose name is `base`.
+///
+/// The draft head holds one layer of the same shape under `mtp.layers.0`, so the
+/// layer code takes the name rather than the index and both callers share it.
+fn matrix_at(base: &str, suffix: &str) -> Matrix {
+    weights::expect(&format!("{base}.{suffix}")).matrix()
+}
+
+fn vector_at(base: &str, suffix: &str) -> Vec<f32> {
+    weights::expect(&format!("{base}.{suffix}")).values()
 }
 
 fn matrix(layer: usize, suffix: &str) -> Matrix {
-    weights::expect(&prefix(layer, suffix)).matrix()
+    matrix_at(&layer_base(layer), suffix)
 }
 
 fn vector(layer: usize, suffix: &str) -> Vec<f32> {
-    weights::expect(&prefix(layer, suffix)).values()
+    vector_at(&layer_base(layer), suffix)
 }
 
 impl Model {
@@ -191,6 +272,20 @@ impl Model {
     /// left in the cache. [`crate::multimodal`] builds a different set for a
     /// prompt that carries an image.
     pub fn forward<T: Trace>(&self, ids: &[u32], cache: &mut Cache, trace: &mut T) -> Vec<f32> {
+        self.forward_states(ids, cache, trace).logits
+    }
+
+    /// [`Model::forward`], keeping the normalised hidden state of every position.
+    ///
+    /// The text model only ever needs the last position's logits, but the draft
+    /// head starts each round from the hidden state that produced the token, so
+    /// a speculative pass has to keep all of them.
+    pub fn forward_states<T: Trace>(
+        &self,
+        ids: &[u32],
+        cache: &mut Cache,
+        trace: &mut T,
+    ) -> Outputs {
         let sequence = ids.len();
         assert!(sequence > 0, "forward needs at least one token");
         let base = cache.length as i64 + cache.position_delta;
@@ -224,7 +319,7 @@ impl Model {
     ) -> Vec<f32> {
         assert_eq!(embeds.len(), sequence * manifest::HIDDEN_SIZE, "embedding rows");
         assert_eq!(positions.len(), sequence, "one position per token");
-        self.forward_hidden(embeds.to_vec(), sequence, positions, cache, trace)
+        self.forward_hidden(embeds.to_vec(), sequence, positions, cache, trace).logits
     }
 
     fn forward_hidden<T: Trace>(
@@ -234,7 +329,7 @@ impl Model {
         positions: &[[u32; 3]],
         cache: &mut Cache,
         trace: &mut T,
-    ) -> Vec<f32> {
+    ) -> Outputs {
         let hidden = manifest::HIDDEN_SIZE;
         let eps = manifest::RMS_NORM_EPS;
         record!(trace, &[sequence, hidden], &x, "embed");
@@ -263,7 +358,8 @@ impl Model {
             } else {
                 let slot = manifest::FULL_LAYERS.iter().position(|value| *value == layer).unwrap();
                 self.full_attention(
-                    layer,
+                    &layer_base(layer),
+                    &format!("layers.{layer}"),
                     &mut cache.attention[slot],
                     &normalized,
                     sequence,
@@ -295,7 +391,7 @@ impl Model {
                 layer
             );
 
-            self.mlp(layer, &normalized, sequence, &mut mixed);
+            self.mlp(&layer_base(layer), &normalized, sequence, &mut mixed);
             for index in 0..x.len() {
                 x[index] += mixed[index];
             }
@@ -325,16 +421,19 @@ impl Model {
             &mut logits,
         );
         record!(trace, &[manifest::VOCAB_SIZE], &logits, "logits_last");
-        logits
+        Outputs {
+            logits,
+            hidden: final_hidden,
+        }
     }
 
     /// `mlp(x) = down(silu(gate(x)) * up(x))`; writes into `out`.
-    fn mlp(&self, layer: usize, x: &[f32], sequence: usize, out: &mut [f32]) {
+    fn mlp(&self, base: &str, x: &[f32], sequence: usize, out: &mut [f32]) {
         let hidden = manifest::HIDDEN_SIZE;
         let intermediate = manifest::INTERMEDIATE_SIZE;
-        let gate = matrix(layer, "mlp.gate_proj.weight");
-        let up = matrix(layer, "mlp.up_proj.weight");
-        let down = matrix(layer, "mlp.down_proj.weight");
+        let gate = matrix_at(base, "mlp.gate_proj.weight");
+        let up = matrix_at(base, "mlp.up_proj.weight");
+        let down = matrix_at(base, "mlp.down_proj.weight");
         let mut gate_values = vec![0.0f32; sequence * intermediate];
         let mut up_values = vec![0.0f32; sequence * intermediate];
         ops::linear(x, sequence, &gate, None, &mut gate_values);
@@ -343,6 +442,24 @@ impl Model {
             gate_values[index] = ops::silu(gate_values[index]) * up_values[index];
         }
         ops::linear(&gate_values, sequence, &down, None, out[..sequence * hidden].as_mut());
+    }
+
+    /// The tied output head: logits for one normalised hidden row.
+    ///
+    /// The head is the embedding table read as a linear layer, so a draft and a
+    /// target token come from the same projection.
+    pub fn output_logits(&self, hidden: &[f32], out: &mut [f32]) {
+        ops::linear(hidden, 1, &embedding_matrix(), None, out);
+    }
+
+    /// Logits for several normalised hidden rows in one pass.
+    ///
+    /// A verification step needs one argmax per row and nothing else, and the
+    /// head is a quarter of the model's multiply-adds, so projecting the rows it
+    /// does not need is the difference between a round that saves time and one
+    /// that loses it.
+    pub fn output_logits_batch(&self, hidden: &[f32], rows: usize, out: &mut [f32]) {
+        ops::linear(hidden, rows, &embedding_matrix(), None, out);
     }
 
     /// Gated DeltaNet, one token at a time.
@@ -549,10 +666,14 @@ impl Model {
     }
 
     /// Full attention with a KV cache, four query heads per key/value head.
+    ///
+    /// `base` names the layer's weights and `label` names it in a trace, so the
+    /// draft head's layer runs this same code under `mtp.layers.0`.
     #[allow(clippy::too_many_arguments)]
     fn full_attention<T: Trace>(
         &self,
-        layer: usize,
+        base: &str,
+        label: &str,
         cache: &mut AttentionCache,
         x: &[f32],
         sequence: usize,
@@ -570,7 +691,7 @@ impl Model {
 
         // --- query and gate come out of one projection, interleaved per head
         let mut packed = vec![0.0f32; sequence * heads * 2 * head_dim];
-        ops::linear(x, sequence, &matrix(layer, "self_attn.q_proj.weight"), None, &mut packed);
+        ops::linear(x, sequence, &matrix_at(base, "self_attn.q_proj.weight"), None, &mut packed);
         let mut query = vec![0.0f32; sequence * heads * head_dim];
         let mut gate = vec![0.0f32; sequence * heads * head_dim];
         for token in 0..sequence {
@@ -583,7 +704,7 @@ impl Model {
             }
         }
 
-        let query_norm = vector(layer, "self_attn.q_norm.weight");
+        let query_norm = vector_at(base, "self_attn.q_norm.weight");
         let mut normalized_query = vec![0.0f32; query.len()];
         ops::rms_norm_zero_centered(
             &query,
@@ -598,18 +719,18 @@ impl Model {
             trace,
             &[sequence, heads, head_dim],
             &query,
-            "layers.{}.self_attn.q_norm.out",
-            layer
+            "{}.self_attn.q_norm.out",
+            label
         );
 
         let mut key = vec![0.0f32; sequence * kv_heads * head_dim];
-        ops::linear(x, sequence, &matrix(layer, "self_attn.k_proj.weight"), None, &mut key);
+        ops::linear(x, sequence, &matrix_at(base, "self_attn.k_proj.weight"), None, &mut key);
         let mut normalized_key = vec![0.0f32; key.len()];
         ops::rms_norm_zero_centered(
             &key,
             sequence * kv_heads,
             head_dim,
-            &vector(layer, "self_attn.k_norm.weight"),
+            &vector_at(base, "self_attn.k_norm.weight"),
             manifest::RMS_NORM_EPS,
             &mut normalized_key,
         );
@@ -618,12 +739,12 @@ impl Model {
             trace,
             &[sequence, kv_heads, head_dim],
             &key,
-            "layers.{}.self_attn.k_norm.out",
-            layer
+            "{}.self_attn.k_norm.out",
+            label
         );
 
         let mut value = vec![0.0f32; sequence * kv_heads * head_dim];
-        ops::linear(x, sequence, &matrix(layer, "self_attn.v_proj.weight"), None, &mut value);
+        ops::linear(x, sequence, &matrix_at(base, "self_attn.v_proj.weight"), None, &mut value);
 
         // --- rotation
         let (cos, sin) = rope_tables(&positions[..sequence]);
@@ -692,7 +813,7 @@ impl Model {
         ops::linear(
             &attended,
             sequence,
-            &matrix(layer, "self_attn.o_proj.weight"),
+            &matrix_at(base, "self_attn.o_proj.weight"),
             None,
             &mut out[..sequence * hidden],
         );

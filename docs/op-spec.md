@@ -514,8 +514,10 @@ Rust 侧读数与判据在下一节末尾。
 
 ## 10. MTP（15 个张量）
 
-**模型类不加载它**（实测 `named_parameters` 里 `mtp.*` 数量为 0），源码里也没有对应
-模块。容器里的名字与形状是唯一的证据：
+**文本模型不加载它**：实测 `named_parameters` 里 `mtp.*` 数量为 0，`modeling_qwen3_5.py:918`
+把 `r"^mtp.*"` 列进 `_keys_to_ignore_on_load_unexpected`，这个包也没有对应模块。它是
+**投机解码的草稿头**，只在带推测的引擎里跑：模型卡 `README.md:630` 给的是 SGLang 的
+`--speculative-algo NEXTN`，`README.md:661` 是 vLLM 的 `method: "qwen3_next_mtp"`。
 
 | 张量 | 形状 |
 |---|---|
@@ -528,13 +530,60 @@ Rust 侧读数与判据在下一节末尾。
 | `mtp.layers.0.mlp.{gate,up,down}_proj` | `[3584,1024]` / `[3584,1024]` / `[1024,3584]` |
 | `mtp.norm.weight` | `[1024]` |
 
-可以确定的是：`fc` 的输入宽 2048 说明它吃两个 1024 维向量的拼接；`layers.0` 是一个
-**只有 self_attn + mlp 的全注意力层**（没有 `linear_attn` 前缀）；两个 `pre_fc_norm_*`
-分别归一化「下一个 token 的 embedding」与「上一个位置的 hidden」。
+接线取自 vLLM 的 `vllm/model_executor/models/qwen3_5_mtp.py`（commit
+`663daccfb9e1f39f9f9f93034bf87bc709d91c06`），它把同一批名字按 `mtp.` → `model.` 重映射后
+加载：
 
-**拼接顺序、norm 是 zero-centered 还是普通 RMSNorm、是否共享主模型的 embedding 与
-输出头——这四件事都没有读数**，M7 必须先按 `config.json` 的 `mtp_num_hidden_layers: 1`
-与 `mtp_use_dedicated_embeddings: false` 构造模块、dump 后对拍，再写进本节。
+1. 分配 `fc = ColumnParallelLinear(2 * hidden, hidden)`，`layers` 用
+   `layer_type="full_attention"` 构造，另有 `norm` / `pre_fc_norm_hidden` /
+   `pre_fc_norm_embedding` 三个 `Qwen3_5RMSNorm`；
+2. 前向：`embed = pre_fc_norm_embedding(embed_tokens(token))`、
+   `h = pre_fc_norm_hidden(hidden)`、`cat([embed, h])` → `fc` → 那一个 full-attention 层
+   → `norm(h, residual)` → 主模型的 **tied 输出头**；
+3. **拼接顺序是 embedding 在前**；`Qwen3_5RMSNorm` 就是 `GemmaRMSNorm`
+   （`qwen3_5.py` 里 `from ...layernorm import GemmaRMSNorm as Qwen3_5RMSNorm`），即零中心
+   `(1 + w)`，与主模型同一个；
+4. `mtp_num_hidden_layers = 1`、`mtp_use_dedicated_embeddings = false`：草稿层只有一层，
+   输入 embedding 复用主模型的表。
+
+**喂进去的 `hidden` 是过完 final norm 的那个**：`Qwen3NextModel.forward` 末尾是
+`hidden_states, _ = self.norm(hidden_states, residual)` 然后 `return hidden_states`，
+草稿头吃的就是它的返回值（`Qwen3_5Model` 继承自它）。相差一个 RMSNorm 就会全盘错。
+
+草稿层有**自己的 KV 缓存**：它是一层 full attention，位置与主模型同一套。实测如果不先用
+prompt 把这份缓存灌满，草稿只看得到自己，接受率从 0.238 掉到 0.183（同一句 prompt、
+`--drafts 3`）。
+
+### 10.1 投机解码的一轮（`src/model/mtp.rs`）
+
+一轮 = 草稿 `steps` 个 token → 主模型一次批量验证 → 保留被确认的前缀。
+
+- 验证批的第 `i` 行是「读完 `drafts[..=i]` 之后」的状态，所以它预测的是 `drafts[i+1]`；
+  第 `i+1` 个草稿被确认当且仅当该行 logits 的 argmax 等于它。
+- 被拒之后，全注意力的 KV 直接回退（写地址是 `past + token`，多出来的条目会被覆写），
+  但**线性注意力的递推状态不能截断**（每个 token 都在原地乘一个衰减并累加）。所以一轮
+  在验证前复制 18 份递推状态（`LinearCache`，共约 18 MB），保留的前缀再走一遍。
+- 输出头占全模型四分之一的乘加，所以一轮只投影它比较的行，其余行不投影。
+
+### 10.2 实测（`cargo run --release --example speculate`）
+
+| 读数 | 值 |
+|---|---|
+| 输出与贪心逐 token 相同 | 是（`--drafts 1/2/3` 全为 `true`） |
+| 草稿接受率（`--drafts 3`，数字接龙 prompt） | 24/30 = 0.800，level-1 10/10 = 1.000 |
+| 草稿接受率（中文默认 prompt） | 0.238（未灌 prompt 时 0.183） |
+| 每轮产出 token 数 | 3.20（`--drafts 3`）/ 2.00（`--drafts 1`，接受率 16/16） |
+| 加速比 | 0.78×（`--drafts 1`）、0.77×（2）、0.67×（3） |
+| 一次 pass，1 token vs 4 token | 20.9 ms / 46.0 ms |
+| 输出头，1 行 vs 3 行 | 5.7 ms / 29.4 ms |
+| 一次草稿步 | 4.3 ms |
+
+**在这台 CPU 上投机解码是亏的**，原因不在接受率（可预测文本上 level-1 全中），而在成本：
+decode 受带宽限制（每个 token 读 495 MB），批量 4 个只省掉那一次权重读，多出来的算力
+是净增；而一轮还要额外付草稿层 `steps` 次、输出头至少两次（草稿各自一次 + 保留行一次），
+以及 60% 轮次上的一次重放。上面那张表里头的 3 行 29.4 ms 是最反常的一项：批量路径的
+权重流式读只有单行路径的一半速率，这是内核问题，不是模型问题。
+
 
 ## 11. 缓存状态与 prefill/decode 一致性
 

@@ -74,6 +74,109 @@ cargo test --features reference-fixtures
 
 `--features force-scalar` 关掉向量内核，用来端到端测量可移植路径。
 
+## 指令集与资源上限
+
+向量内核按平台各写一份，语义相同、宽度不同，由 [`cpu::features`](src/cpu.rs) 选择：
+
+| 平台 | 内核 | 宽度 |
+|---|---|---|
+| x86-64（Intel、AMD 同一套） | AVX2 + FMA3 | 8 × f32 |
+| ARM 64 位（Android、iOS、Apple Silicon） | Advanced SIMD（NEON）+ FMA | 4 × f32 |
+| 其它（含 32 位 ARM） | 标量 | 1 |
+
+AVX2 与 FMA3 是 x86-64 的公共扩展，不是某一家的指令；NEON 在 ARMv8-A 里是必备项，所以
+64 位 ARM 不需要运行时检测。两个内核都由 `ops` 的单元测试与标量路径对拍（展开逐位相等，
+点积在求和次序的误差内），这些测试在任何平台上构建时都会跑。
+
+生成是 fork-join 负载，会把给它的核全部用满。库因此收一个 [`parallel::Budget`]，而不是
+自己决定：
+
+```rust
+qwen35::parallel::set_budget(qwen35::parallel::Budget {
+    threads: 4,        // 0 = 按机器核数减去 reserve
+    reserve: 2,        // 留给宿主的核数
+    priority: qwen35::parallel::Priority::Background,
+});
+```
+
+默认就是让路的那一档：最多 16 个 worker、留 2 个核、优先级低于所有普通线程。Windows 用
+`THREAD_PRIORITY_LOWEST`，Linux/Android 用 `SCHED_IDLE`，macOS 用 `PRIO_DARWIN_BG`，三者都
+无需特权且可随时改回。宿主在加载关卡、开菜单时可以调 `set_priority` 让路，也可以反过来把
+核收回去。
+
+## GPU 后端
+
+`--features wgpu` 打开第二个后端，默认关闭——打开它才第一次引入依赖，默认构建仍然是零依赖。
+
+```
+cargo run --release --features wgpu --example gpu_bench
+cargo test  --features wgpu --test gpu
+```
+
+两个内核目前搬到了设备上：q4 展开与 q4 矩阵-向量乘。判据按结果种类分开，因为在 WGSL 里
+**归约的结合次序与乘加是否融合由实现决定**：
+
+| 内核 | 判据 | 实测（RTX 4090 / Vulkan） |
+|---|---|---|
+| 展开（逐元素，无归约） | 逐位相等 | 524,288 / 524,288 个值等于 CPU |
+| 矩阵-向量（归约） | 相对误差 < 1e-5 | 最差 5.8e-7 |
+
+## 一次前向只提交一次
+
+设备后端**不接受逐算子调用**。`backend::Flow` 记录整趟前向（哪些内核、在哪些缓冲区、用哪些
+权重），`Device::execute` 按 64 个算子一块边录边提交，回读一次。分块而不是一张 command buffer
+是量出来的：设备在主机录后面的块时就已经开工，解码一步因此少约 2 ms，队列保证跨块的顺序。
+原因是可算的：单次提交 + 回读约 0.6 ms，一次前向约 200 个算子 ⇒ 逐算子会付 120 ms 的搬运。
+
+已搬进 `Flow` 的算子：
+
+| 算子 | 判据 | 实测误差 |
+|---|---|---|
+| `Dequantize` | 逐元素，**逐位相等** | 0 |
+| `Linear`（q4 矩阵-向量） | 归约，相对误差 | ≤ 5.8e-7 |
+| `RmsNorm` / `GatedRmsNorm` / `LayerNorm` | 归约，相对误差 | ≤ 4.1e-7 |
+| `SiluMul` / `Scale` / `Rope` | 逐元素，**逐位相等** | 0 |
+| `Softmax` / `Sum` / `ArgMax` | 归约 / 精确 | ≤ 1.1e-7 |
+| `DeltaRule`（GDN 递推） | 归约，相对误差 | ≤ 1.1e-7 |
+
+一层的 MLP 作为 5 个算子的整趟 pass：
+
+| 调用方式 | 实测 |
+|---|---|
+| 逐算子提交，`k_proj` 512×1024 | 0.81 ms（CPU 0.06 ms，**0.08×**） |
+| 逐算子提交，`embed_tokens` 248320×1024 | 2.24 ms（CPU 6.24 ms，2.79×） |
+| **整趟 5 个算子一次提交** | **0.87 ms**（CPU 0.94 ms，1.09×，五个中间缓冲全部 ≤ 1.1e-7） |
+
+同样的 5 个算子若各自提交，按 `k_proj` 那行量到的固定开销算要约 4 ms；合成一次提交后是
+0.87 ms。**这就是"一次前向一次调度"与"一算子一次调度"的差别。**
+
+### 整趟前向已经可以录下来
+
+`Model::forward_recorded` 把**整个模型**录成一份 `Spec`（24 层、两种注意力、MLP、输出头），
+再由 `backend::execute` 一趟执行完。它与逐算子路径的判据是**逐位相等**：
+
+```
+tests/recorded.rs
+  the_recorded_pass_is_the_direct_one_bit_for_bit        ok   logits 全等
+  the_recorded_pass_reads_the_cache_it_is_given          ok   从已填缓存继续
+  the_recorded_steps_carry_their_state                   ok   连续三步解码，token 序列相同
+```
+
+第三条是生成循环的形状：状态（KV 缓存、卷积窗口、递推状态）以 `Slot::External` 交给 pass，
+`Model::forward_recorded_step` 把它交还给调用方，下一步再喂回去。如果这一步没接对，第一步
+会对、第二步就发散。
+
+### 设备侧
+
+设备执行器实现全部 21 个算子，整趟前向（514 个算子、199 个张量、5 个 token）一次录完，
+与 CPU 执行器的相对误差 ≤ 1.8e-5，argmax 相同。状态（KV 缓存、卷积窗口、递推状态）留在
+`DeviceState` 的设备缓冲区里，跨调用不重传。
+
+录制声明的是**每个中间值一个 slot**，512 token 的 prefill 因此声明 1.9 GB，而任意瞬间活着的
+只有几个缓冲。`backend::layout` 按活跃区间把 slot 叠到同一块存储上，同一趟变成 12 块、49 MB；
+1536 token 从“超过单缓冲上限直接报错”变成 148 MB 可跑。回读点名的 slot 不共享存储，所以
+`execute_stateful_reading` 读到的一定是它自己最后写进去的值。
+
 ## 嵌入的表
 
 三个文件都用 `include_bytes!` 编译进去，放在 `#[repr(C, align(64))]` 的静态里（rustc 不
