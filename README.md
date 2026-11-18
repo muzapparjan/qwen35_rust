@@ -5,7 +5,8 @@ Qwen3.5-0.8B 的 Rust 推理库。默认构建是 **CPU 路径、零第三方依
 
 权重是一份 QWQT 量化容器（4-bit 分组量化，494,845,446 B），**编译期嵌入**，
 运行时不做任何文件 IO。容器本身是 release asset，不在仓库里：第一次构建前先跑
-`scripts/fetch-weights.ps1` 把它取到 `src/weights/` 并校验。
+`scripts/fetch-weights.ps1` 把它取到 `src/weights/` 并校验。公开仓库不需要凭据；
+私有镜像要 `GITHUB_TOKEN`（读取权限即可），脚本会自动改走 API 取资产。
 
 算子级的规格（每个算子的作用轴、来自参考实现的哪一行）在
 [`docs/op-spec.md`](docs/op-spec.md)。

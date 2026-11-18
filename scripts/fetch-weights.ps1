@@ -7,8 +7,16 @@
     file, so a fresh clone has to fetch it before the crate can compile. The
     download is verified by length and SHA256 and only then moved into place.
 
-.PARAMETER Url
-    Where to download from. Defaults to the v1.0.0 release asset.
+.PARAMETER Tag
+    Release to take the container from. Defaults to v1.0.0.
+
+.PARAMETER Token
+    A GitHub token with read access to the repository. Defaults to the
+    GITHUB_TOKEN environment variable, then GH_TOKEN.
+
+    A public repository needs none: the release asset is served anonymously.
+    A private one needs this, because the anonymous request answers 404 and the
+    download goes through the API asset endpoint instead.
 
 .PARAMETER Destination
     Where to write the container. Defaults to src/weights/qwen3.5-0.8b-q4.qwqt
@@ -16,7 +24,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Url = 'https://github.com/muzapparjan/qwen35_rust/releases/download/v1.0.0/qwen3.5-0.8b-q4.qwqt',
+    [string] $Tag = 'v1.0.0',
+    [string] $Token = $(if ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { $env:GH_TOKEN }),
     [string] $Destination
 )
 
@@ -25,6 +34,11 @@ $ErrorActionPreference = 'Stop'
 
 $ExpectedBytes = 494845446
 $ExpectedSha256 = '29773850A7AC53122E1544A24748701B55FA59CA63FED89CAE71B9BAABC7DFB9'
+
+$Owner = 'muzapparjan'
+$Repository = 'qwen35_rust'
+$AssetName = 'qwen3.5-0.8b-q4.qwqt'
+$UserAgent = 'qwen35-rust'
 
 if (-not $Destination) {
     $root = Split-Path -Parent $PSScriptRoot
@@ -37,6 +51,37 @@ function Get-FileBytes([string] $Path) {
 
 function Get-FileSha256([string] $Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+# The anonymous URL answers 404 on a private repository. The API asset endpoint
+# answers 302 to a signed storage URL, which Invoke-WebRequest follows, and the
+# Authorization header survives that hop.
+function Get-DownloadRequest([string] $Tag, [string] $Token) {
+    if (-not $Token) {
+        return @{
+            Uri = "https://github.com/$Owner/$Repository/releases/download/$Tag/$AssetName"
+            Headers = @{ 'User-Agent' = $UserAgent }
+        }
+    }
+
+    $releaseUri = "https://api.github.com/repos/$Owner/$Repository/releases/tags/$Tag"
+    $release = Invoke-RestMethod -Uri $releaseUri -Headers @{
+        Authorization = "Bearer $Token"
+        Accept = 'application/vnd.github+json'
+        'User-Agent' = $UserAgent
+    }
+    $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+    if (-not $asset) {
+        throw "release ${Tag} has no asset called $AssetName"
+    }
+    return @{
+        Uri = $asset.url
+        Headers = @{
+            Authorization = "Bearer $Token"
+            Accept = 'application/octet-stream'
+            'User-Agent' = $UserAgent
+        }
+    }
 }
 
 if (Test-Path -LiteralPath $Destination) {
@@ -56,8 +101,21 @@ if (Test-Path -LiteralPath $partial) {
 # The progress bar costs more than the download at this size in Windows
 # PowerShell 5.1.
 $ProgressPreference = 'SilentlyContinue'
-Write-Host "downloading $Url"
-Invoke-WebRequest -Uri $Url -OutFile $partial -UseBasicParsing
+$request = Get-DownloadRequest -Tag $Tag -Token $Token
+Write-Host "downloading $($request.Uri)"
+try {
+    Invoke-WebRequest -Uri $request.Uri -OutFile $partial -UseBasicParsing -Headers $request.Headers
+}
+catch {
+    if (Test-Path -LiteralPath $partial) {
+        Remove-Item -LiteralPath $partial -Force
+    }
+    $response = $_.Exception.Response
+    if ($response -and [int] $response.StatusCode -eq 404 -and -not $Token) {
+        throw "$($request.Uri) answered 404. If this repository is private, set GITHUB_TOKEN (or pass -Token) and run again."
+    }
+    throw
+}
 
 $bytes = Get-FileBytes $partial
 if ($bytes -ne $ExpectedBytes) {
