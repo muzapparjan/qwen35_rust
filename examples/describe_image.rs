@@ -80,6 +80,7 @@ fn main() {
     println!("prefill: {:.2} s", started.elapsed().as_secs_f64());
 
     let mut produced = Vec::new();
+    let mut streamed = tokenizer.decoder();
     for _ in 0..tokens {
         let next = top(&logits);
         if next == manifest::EOS_TOKEN_ID {
@@ -87,7 +88,7 @@ fn main() {
         }
         produced.push(next);
         logits = model.forward(&[next], &mut cache, &mut NoTrace);
-        print!("{}", tokenizer.decode(&[next]));
+        print!("{}", streamed.feed(next));
         use std::io::Write;
         std::io::stdout().flush().ok();
     }

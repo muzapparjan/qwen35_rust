@@ -122,6 +122,14 @@ impl Tokenizer {
         for index in 0..=manifest::VOCAB_COUNT {
             offsets.push(u32_at(bytes, manifest::VOCAB_OFFSETS + 4 * index));
         }
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the vocabulary offsets are not monotonic"
+        );
+        assert!(
+            manifest::VOCAB_POOL + offsets[manifest::VOCAB_COUNT] as usize <= bytes.len(),
+            "the vocabulary pool runs past the blob"
+        );
         let pool = &bytes[manifest::VOCAB_POOL..manifest::VOCAB_POOL
             + offsets[manifest::VOCAB_COUNT] as usize];
 
@@ -141,6 +149,10 @@ impl Tokenizer {
         assert!(
             added.iter().all(|token| token.flags & manifest::FLAG_NORMALIZED == 0),
             "a normalised added token needs the normalisation pass this build does not have yet"
+        );
+        assert!(
+            added.windows(2).all(|pair| pair[0].id < pair[1].id),
+            "added tokens are not sorted by id"
         );
 
         Tokenizer {
@@ -322,6 +334,123 @@ impl Tokenizer {
             .iter()
             .map(|token| (token.id, token.content, token.is_special()))
     }
+
+    /// A decoder for ids that arrive one at a time.
+    ///
+    /// [`Tokenizer::decode`] turns a whole sequence into text. A caller that
+    /// writes each token as it is produced needs this instead: a character's bytes
+    /// can be spread over several ids — nine of ten in `🎉🎉🎉 emoji` end in the
+    /// middle of one — and decoding such an id alone yields `U+FFFD`.
+    pub fn decoder(&self) -> IncrementalDecoder<'_> {
+        IncrementalDecoder {
+            tokenizer: self,
+            pending: Vec::new(),
+            out: String::new(),
+        }
+    }
+}
+
+/// Text from ids that arrive one at a time.
+///
+/// The unfinished tail of a character is held until the id that completes it, so
+/// what comes out is only whole characters. Concatenating what a sequence of
+/// [`IncrementalDecoder::feed`] calls returned is the same string as
+/// [`Tokenizer::decode`] of the whole sequence, including the replacement
+/// characters a genuinely broken byte sequence produces.
+pub struct IncrementalDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    /// Bytes of a character that has not ended yet; never more than three.
+    pending: Vec<u8>,
+    /// What the last call completed, so a caller can write it without allocating.
+    out: String,
+}
+
+impl IncrementalDecoder<'static> {
+    /// A decoder over [`tokenizer`], the shared table.
+    pub fn new() -> IncrementalDecoder<'static> {
+        tokenizer().decoder()
+    }
+}
+
+impl Default for IncrementalDecoder<'static> {
+    fn default() -> IncrementalDecoder<'static> {
+        IncrementalDecoder::new()
+    }
+}
+
+impl<'a> IncrementalDecoder<'a> {
+    /// Add one id, and take the text that is now complete.
+    pub fn feed(&mut self, id: u32) -> &str {
+        self.out.clear();
+        if let Some(bytes) = self.tokenizer.token_bytes(id) {
+            self.pending.extend_from_slice(bytes);
+        }
+        self.drain();
+        &self.out
+    }
+
+    /// Add several ids, and take the text that is now complete.
+    pub fn feed_all(&mut self, ids: &[u32]) -> &str {
+        self.out.clear();
+        for id in ids {
+            if let Some(bytes) = self.tokenizer.token_bytes(*id) {
+                self.pending.extend_from_slice(bytes);
+            }
+        }
+        self.drain();
+        &self.out
+    }
+
+    /// The tail a sequence ended in the middle of, as replacement characters.
+    ///
+    /// Only a model that stopped mid-character leaves anything here; a finished
+    /// text has nothing pending.
+    pub fn finish(&mut self) -> &str {
+        self.out.clear();
+        if !self.pending.is_empty() {
+            self.out.push_str(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+        }
+        &self.out
+    }
+
+    /// How many bytes of an unfinished character are held.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn drain(&mut self) {
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    self.out.push_str(text);
+                    self.pending.clear();
+                    return;
+                }
+                Err(error) => match error.error_len() {
+                    // A byte that cannot start or continue any character: the same
+                    // replacement `decode` would produce for it.
+                    Some(length) => {
+                        let at = error.valid_up_to();
+                        if let Ok(text) = std::str::from_utf8(&self.pending[..at]) {
+                            self.out.push_str(text);
+                        }
+                        self.out.push('\u{FFFD}');
+                        self.pending.drain(..at + length);
+                    }
+                    // A character that has not ended yet: keep it and wait.
+                    None => {
+                        let at = error.valid_up_to();
+                        if let Ok(text) = std::str::from_utf8(&self.pending[..at]) {
+                            self.out.push_str(text);
+                        }
+                        self.pending.drain(..at);
+                        return;
+                    }
+                },
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +462,70 @@ mod tests {
         assert_eq!(&blob()[..4], b"QWBT");
         assert_eq!(blob().len(), manifest::FILE_LEN);
         assert_eq!(u32_at(blob(), 4), manifest::VERSION);
+    }
+
+    /// Ids that cut through characters: emoji, rare Hanzi, runes, a plane-1
+    /// character, and text that is not cut at all.
+    const SPLIT_CASES: &[&str] = &[
+        "中文流式输出：第一个字符通常是多字节的。",
+        "🎉🎉🎉 emoji",
+        "龘靐齉爩 rare",
+        "ᚠᚢᚦᚨᚱᚲ runes",
+        "𠜎𠜱𠝹𠱓 extension B",
+        "नमस्ते दुनिया",
+        "Здравствуйте, мир",
+        "a",
+        "",
+    ];
+
+    #[test]
+    fn feeding_ids_one_at_a_time_is_the_whole_decode() {
+        let tokenizer = tokenizer();
+        for text in SPLIT_CASES {
+            let ids = tokenizer.encode(text);
+            let mut decoder = tokenizer.decoder();
+            let mut streamed = String::new();
+            for id in &ids {
+                streamed.push_str(decoder.feed(*id));
+                assert!(
+                    !streamed.contains('\u{FFFD}'),
+                    "{text:?}: a character was written before it ended"
+                );
+            }
+            streamed.push_str(decoder.finish());
+            assert_eq!(streamed, tokenizer.decode(&ids), "{text:?}");
+            assert_eq!(streamed, *text, "{text:?}");
+            assert_eq!(decoder.pending_bytes(), 0, "{text:?} ended mid-character");
+        }
+    }
+
+    #[test]
+    fn the_whole_sequence_at_once_is_the_same_text() {
+        let tokenizer = tokenizer();
+        let ids: Vec<u32> = SPLIT_CASES
+            .iter()
+            .flat_map(|text| tokenizer.encode(text))
+            .collect();
+        let mut decoder = tokenizer.decoder();
+        let at_once = decoder.feed_all(&ids).to_string();
+        assert_eq!(at_once, tokenizer.decode(&ids));
+        assert_eq!(decoder.pending_bytes(), 0, "a finished text holds a tail");
+        assert_eq!(decoder.finish(), "", "nothing is held after a finished text");
+        assert_eq!(decoder.feed_all(&[]), "", "an empty sequence is no text");
+    }
+
+    #[test]
+    fn a_tail_that_never_completes_is_reported_as_a_replacement_character() {
+        let tokenizer = tokenizer();
+        // The first id of `🎉`, on its own: it starts a four-byte character that
+        // nothing completes.
+        let ids = tokenizer.encode("🎉");
+        let mut decoder = tokenizer.decoder();
+        let first = decoder.feed(ids[0]);
+        assert_eq!(first, "", "a partial character is text only once it ends");
+        assert!(decoder.pending_bytes() > 0);
+        assert_eq!(decoder.finish(), "\u{FFFD}");
+        assert_eq!(decoder.pending_bytes(), 0);
     }
 
     #[test]

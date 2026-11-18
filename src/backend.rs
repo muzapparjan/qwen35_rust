@@ -121,7 +121,7 @@ pub enum Op {
         eps: f32,
         out: Slot,
     },
-    /// `out = (x - mean) / sqrt(variance + eps) * (1 + weight) + bias`.
+    /// `out = (x - mean) / sqrt(variance + eps) * weight + bias`.
     LayerNorm {
         input: Slot,
         rows: usize,
@@ -169,6 +169,8 @@ pub enum Op {
         out: Slot,
     },
     /// `rotate_half` with the pairing `(i, i + half)`.
+    ///
+    /// `cos` and `sin` hold one row of `rotary / 2` angles per row of the input.
     Rope {
         input: Slot,
         cos: Slot,
@@ -349,6 +351,18 @@ impl Layout {
 pub fn layout(spec: &Spec, wanted: &[bool]) -> Layout {
     let count = spec.buffers.len();
     assert_eq!(wanted.len(), count, "one wanted flag per slot");
+
+    // An attention operator appends to both caches and reads them back, so the two
+    // have to be different slots: one slot cannot hold two histories, and the
+    // executors take each out of the arena in turn.
+    for op in &spec.ops {
+        if let Op::Attention { keys, values, .. } = op {
+            assert_ne!(
+                keys, values,
+                "an attention operator needs a key cache and a value cache of its own"
+            );
+        }
+    }
 
     // The last operator that touches each slot, read or written.
     let mut last = vec![usize::MAX; count];
@@ -1064,7 +1078,7 @@ pub fn execute<W: Weights>(weights: &W, spec: &Spec, arena: &mut Arena) {
                     let target = &mut scratch[row * width..(row + 1) * width];
                     for index in 0..width {
                         target[index] =
-                            (source[index] - mean) * inverse * (1.0 + gain[index]) + shift[index];
+                            (source[index] - mean) * inverse * gain[index] + shift[index];
                     }
                 }
                 write(arena, out, &scratch);
@@ -1174,11 +1188,17 @@ pub fn execute<W: Weights>(weights: &W, spec: &Spec, arena: &mut Arena) {
                 let values: Vec<f32> = read(spec, arena, input, rows * width).to_vec();
                 let cosines: Vec<f32> = read(spec, arena, cos, usize::MAX).to_vec();
                 let sines: Vec<f32> = read(spec, arena, sin, usize::MAX).to_vec();
+                let half = rotary / 2;
+                assert_eq!(
+                    cosines.len(),
+                    rows * half,
+                    "the rope table holds one angle row per position"
+                );
+                assert_eq!(sines.len(), cosines.len(), "one sine row per cosine row");
                 scratch.resize(rows * width, 0.0);
                 scratch.copy_from_slice(&values);
                 for row in 0..rows {
-                    let offset = (row % cosines.len().max(1)) * rotary / 2;
-                    let half = rotary / 2;
+                    let offset = row * half;
                     crate::ops::apply_rope(
                         &mut scratch[row * width..row * width + width],
                         rotary,
@@ -1365,7 +1385,16 @@ pub fn execute<W: Weights>(weights: &W, spec: &Spec, arena: &mut Arena) {
                     read(spec, arena, value, tokens * kv_heads * width).to_vec();
                 let keys_index = state_index_of(keys);
                 let values_index = state_index_of(values);
+                // The caches have to hold the whole prefix plus this pass' tokens:
+                // an append writes at `past + token`, so a state buffer that did not
+                // grow would be written past its end.
                 let total = past + tokens;
+                let needed = total * kv_heads * width;
+                assert!(
+                    arena.externals[keys_index].len() >= needed
+                        && arena.externals[values_index].len() >= needed,
+                    "the caches hold fewer than {total} positions"
+                );
                 {
                     // Both caches at once: `split_at_mut` keeps the borrow checker
                     // honest without a second copy of the buffers.
@@ -1424,7 +1453,6 @@ pub fn execute<W: Weights>(weights: &W, spec: &Spec, arena: &mut Arena) {
                 }
                 arena.externals[keys_index] = cached_keys;
                 arena.externals[values_index] = cached_values;
-                let _ = total;
                 write(arena, out, &attended);
             }
         }
@@ -1471,21 +1499,23 @@ fn read<'a>(spec: &'a Spec, arena: &'a Arena, slot: Slot, length: usize) -> &'a 
 }
 
 fn write(arena: &mut Arena, slot: Slot, values: &[f32]) {
-    let slot = match slot {
-        Slot::Buffer(index) => Slot::Buffer(index),
-        Slot::External(index) => {
-            // A state buffer is written in place; its length is the caller's.
-            let target = &mut arena.externals[index];
-            target.fill(0.0);
-            let count = values.len().min(target.len());
-            target[..count].copy_from_slice(&values[..count]);
-            return;
-        }
-        Slot::Bound(index) => panic!("bound slot {index} is not writable"),
-    };
     match slot {
         Slot::Buffer(index) => arena.set_buffer(index, values),
-        _ => unreachable!(),
+        Slot::External(index) => {
+            // A state buffer is written in place, and the operator's output has to
+            // fill it: a short write would leave a stale tail that the next pass
+            // reads back as state.
+            let target = &mut arena.externals[index];
+            assert_eq!(
+                values.len(),
+                target.len(),
+                "state slot {index} takes {} values, not {}",
+                target.len(),
+                values.len()
+            );
+            target.copy_from_slice(values);
+        }
+        Slot::Bound(index) => panic!("bound slot {index} is not writable"),
     }
 }
 
@@ -1560,5 +1590,68 @@ mod tests {
         let laid = layout(&spec, &[false, false]);
         assert_eq!(laid.storage(0), 0, "the updated buffer moved");
         assert_eq!(laid.lengths().len(), 2, "slot 1 is live while 0 is read");
+    }
+
+    /// One slot cannot be both of an attention operator's caches: the executors
+    /// take each out of the arena in turn to write and read it.
+    #[test]
+    #[should_panic(expected = "a key cache and a value cache of its own")]
+    fn an_attention_operator_needs_two_caches() {
+        let spec = Spec {
+            tensors: Vec::new(),
+            vectors: Vec::new(),
+            buffers: vec![4],
+            externals: vec![4, 4],
+            ops: vec![Op::Attention {
+                query: Slot::Buffer(0),
+                key: Slot::Buffer(0),
+                value: Slot::Buffer(0),
+                keys: Slot::External(0),
+                values: Slot::External(0),
+                tokens: 1,
+                heads: 1,
+                kv_heads: 1,
+                width: 4,
+                past: 0,
+                out: Slot::Buffer(0),
+            }],
+        };
+        let _ = layout(&spec, &[false]);
+    }
+
+    /// The weights a spec that only names bound vectors does not need.
+    struct NoTensors;
+
+    impl Weights for NoTensors {
+        fn matrix(&self, name: &str) -> Matrix {
+            panic!("this spec reads no tensor {name:?}")
+        }
+    }
+
+    /// The normalisation multiplies by its weight; the centred value is not added
+    /// beside it, which is what a `(1 + weight)` form would do.
+    #[test]
+    fn a_layer_norm_applies_its_weight_as_given() {
+        let spec = Spec {
+            tensors: Vec::new(),
+            // weight, bias, input
+            vectors: vec![vec![2.0, 2.0], vec![100.0, 100.0], vec![0.0, 2.0]],
+            buffers: vec![2],
+            externals: Vec::new(),
+            ops: vec![Op::LayerNorm {
+                input: Slot::Bound(2),
+                rows: 1,
+                width: 2,
+                weight: Weight::Bound(0),
+                bias: Weight::Bound(1),
+                eps: 0.0,
+                out: Slot::Buffer(0),
+            }],
+        };
+        let mut arena = Arena::with_state(&spec, Vec::new());
+        execute(&NoTensors, &spec, &mut arena);
+        // Mean 1 and variance 1, so the centred values are -1 and 1; a weight of
+        // two makes them -2 and 2, and the bias moves both by 100.
+        assert_eq!(arena.buffer(0), [98.0, 102.0]);
     }
 }

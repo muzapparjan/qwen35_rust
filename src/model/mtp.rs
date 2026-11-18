@@ -165,10 +165,10 @@ impl Model {
     ///
     /// The draft layer attends over its own history, so a round that started
     /// from an empty cache would propose from nothing but its own last step. The
-    /// prompt is consumed the way a round consumes generation: the token at a
-    /// position is predicted from the target's hidden state for the position
-    /// before it, so the last prompt position has no successor to predict and is
-    /// skipped.
+    /// prompt is consumed the way a round consumes generation: a token is paired
+    /// with the target's hidden state for the position before it, so the first
+    /// prompt token has no predecessor to pair with and is skipped, and the last
+    /// hidden state predicts a token the loop discards.
     ///
     /// `hidden` is [`crate::model::Outputs::hidden`] for `ids`, one row per
     /// token.
@@ -210,6 +210,11 @@ impl Model {
         let first = argmax(logits);
         let start = (cache.length as i64 + cache.position_delta).max(0) as u32;
 
+        // The state to come back to if the tail is rejected. Taken before the
+        // drafting loop, because that loop advances the draft head's own cache and a
+        // rollback has to undo those entries as well.
+        let snapshot = cache.snapshot();
+
         // --- draft, each step reading the head's own previous output
         let mut drafts = Vec::with_capacity(steps + 1);
         drafts.push(first);
@@ -227,7 +232,6 @@ impl Model {
         }
 
         // --- verify every proposal in one pass
-        let snapshot = cache.snapshot();
         let mut outputs = self.forward_states(&drafts, cache, &mut NoTrace);
 
         // Row `i` is the target's state after reading `drafts[..=i]`, so its
@@ -259,14 +263,16 @@ impl Model {
         // rewrites, are projected one at a time.
         let replayed = accepted < steps;
         let kept: Vec<f32> = if replayed {
-            cache.rollback(&snapshot, accepted);
+            // Keep one entry per accepted token: the drafting loop wrote one per
+            // proposal, and the accepted proposals are its first `accepted + 1`
+            // ones. When every proposal is accepted the loop wrote `steps` entries
+            // and the last verified token has none.
+            cache.rollback(&snapshot, (accepted + 1).min(steps));
             outputs = self.forward_states(&drafts[..=accepted], cache, &mut NoTrace);
             let base = accepted * width;
             let mut kept = vec![0.0f32; manifest::VOCAB_SIZE];
             self.output_logits(&outputs.hidden[base..base + width], &mut kept);
             kept
-        } else if accepted < steps {
-            projections[accepted * manifest::VOCAB_SIZE..(accepted + 1) * manifest::VOCAB_SIZE].to_vec()
         } else {
             let base = accepted * width;
             let mut kept = vec![0.0f32; manifest::VOCAB_SIZE];

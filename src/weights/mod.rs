@@ -1,8 +1,9 @@
 //! The model weights, embedded at compile time.
 //!
-//! The container is a QWQT file: an 8-byte prefix, a UTF-8 JSON header and a
-//! payload that every tensor slices into. `manifest.rs` is generated from that
-//! header, so nothing here parses JSON or does file IO.
+//! The container is a QWQT file: a 4-byte magic, a `u32` version, a `u32` header
+//! length, a UTF-8 JSON header and a payload that every tensor slices into.
+//! `manifest.rs` is generated from that header, so nothing here parses JSON or
+//! does file IO.
 //!
 //! The file is embedded whole rather than unpacked into Rust constants: the
 //! payload is 494,764,800 bytes, and rewriting it as generated source would cost

@@ -12,7 +12,7 @@
 #![cfg(feature = "wgpu")]
 
 use qwen35::backend::{self, Arena, Flow, Slot};
-use qwen35::gpu::Device;
+use qwen35::gpu::{Device, DeviceState};
 
 fn device() -> Option<Device> {
     match Device::new() {
@@ -80,6 +80,94 @@ fn the_device_multiplies_a_vector() {
         0,
         "scale_all differs: worst {}",
         worst(&expected, &actual)
+    );
+}
+
+/// More workgroups than one dispatch dimension can name: the host puts the rest
+/// in `id.y`, and the kernel has to read it.
+///
+/// The length is one element past the 4,194,240 that 65,535 workgroups of 64
+/// threads cover.
+#[test]
+fn a_dispatch_wider_than_the_workgroup_cap_covers_its_tail() {
+    let Some(_) = device() else {
+        return;
+    };
+    let length = 65_535 * 64 + 128;
+    let values: Vec<f32> = (0..length).map(|index| index as f32).collect();
+    let mut flow = Flow::new();
+    let input = flow.bind(values);
+    let out = flow.buffer(length);
+    flow.scale(input, 2.0, out);
+
+    let (expected, actual) = both(flow, out);
+    assert_eq!(
+        actual[length - 1],
+        2.0 * (length - 1) as f32,
+        "the last element of the dispatch was not written"
+    );
+    assert_eq!(
+        differences(&expected, &actual),
+        0,
+        "worst {}",
+        worst(&expected, &actual)
+    );
+}
+
+/// The row kernels have the same cap, and the rows past it have to be computed.
+#[test]
+fn rows_past_the_workgroup_cap_are_computed() {
+    let Some(_) = device() else {
+        return;
+    };
+    let rows = 65_536;
+    let width = 2;
+    let values = vec![0.0f32; rows * width];
+    let mut flow = Flow::new();
+    let input = flow.bind(values);
+    let out = flow.buffer(rows * width);
+    flow.softmax(input, rows, width, out);
+
+    let (expected, actual) = both(flow, out);
+    assert_eq!(
+        actual[rows * width - 1],
+        0.5,
+        "the last row of the dispatch was not computed"
+    );
+    assert_eq!(
+        differences(&expected, &actual),
+        0,
+        "worst {}",
+        worst(&expected, &actual)
+    );
+}
+
+/// A wanted slot that holds no values contributes nothing to the staging buffer,
+/// and the slot after it must still read from its own place.
+#[test]
+fn an_empty_wanted_slot_does_not_shift_the_read_back() {
+    let Some(device) = device() else {
+        return;
+    };
+    let mut flow = Flow::new();
+    let input = flow.bind(vec![1.0f32, 2.0, 3.0, 4.0]);
+    let empty = flow.buffer(0);
+    let out = flow.buffer(4);
+    flow.scale(input, 3.0, out);
+    let spec = flow.finish();
+    let index = |slot: Slot| match slot {
+        Slot::Buffer(index) => index,
+        _ => panic!("the compared slot is an arena buffer"),
+    };
+    let (empty, out) = (index(empty), index(out));
+
+    let mut state = DeviceState::new();
+    let arena = device.execute_stateful_reading(&spec, &mut state, &[empty, out]);
+    assert_eq!(arena.buffer(empty).len(), 0, "the empty slot came back with data");
+    assert_eq!(
+        arena.buffer(out),
+        [3.0, 6.0, 9.0, 12.0],
+        "the slot after the empty one read from the wrong offset"
     );
 }
 

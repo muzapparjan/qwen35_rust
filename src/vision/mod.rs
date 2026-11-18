@@ -61,7 +61,7 @@ pub mod constants {
 /// Where a token sits: the patch grid of one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
-    /// Frames; one for an image.
+    /// Frames. [`encode_patches`] reads one frame per call.
     pub temporal: usize,
     /// Patches down.
     pub height: usize,
@@ -329,7 +329,21 @@ pub fn encode(pixels: &[u8], height: usize, width: usize) -> Result<Encoded, Err
 ///
 /// The rows are [`preprocess::pixel_values`]'s layout: one row per patch, in
 /// merge-block order, `(channel, frame, patch row, patch column)` within a row.
+/// One call encodes one frame: the position table and the rotation are built for
+/// a single grid, so a `temporal` above one is not a grid this path reads.
 pub fn encode_patches(values: &[f32], grid: Grid) -> Encoded {
+    let merge = constants::MERGE;
+    assert_eq!(
+        grid.temporal, 1,
+        "encode_patches reads one frame, and this grid holds {}",
+        grid.temporal
+    );
+    assert!(
+        grid.height % merge == 0 && grid.width % merge == 0,
+        "a grid is whole {merge}x{merge} merge blocks: {}x{}",
+        grid.height,
+        grid.width
+    );
     let patches = grid.patches();
     let hidden = constants::HIDDEN;
     assert_eq!(values.len(), patches * constants::PATCH_VALUES, "patch rows");
@@ -436,7 +450,6 @@ pub fn encode_patches(values: &[f32], grid: Grid) -> Encoded {
 
     // --- the merger: normalise each patch, fold 2x2 of them into one row, then
     // two projections with the exact GELU between them.
-    let merge = constants::MERGE;
     let merged = patches / (merge * merge);
     let merger_norm_weight = vector("model.visual.merger.norm.weight".to_string());
     let merger_norm_bias = vector("model.visual.merger.norm.bias".to_string());

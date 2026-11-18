@@ -196,7 +196,7 @@ fn the_arena_shares_storage_between_slots_that_are_not_live_at_once() {
     };
 
     let declared: usize = recorded.spec.buffers.iter().sum();
-    let mut all = vec![true; recorded.spec.buffers.len()];
+    let all = vec![true; recorded.spec.buffers.len()];
     let whole = layout(&recorded.spec, &all);
     let mut some = vec![false; recorded.spec.buffers.len()];
     some[logits] = true;
@@ -223,7 +223,6 @@ fn the_arena_shares_storage_between_slots_that_are_not_live_at_once() {
 
     let mut state = DeviceState::seeded(&recorded.spec, &recorded.state);
     let everything = device.execute_stateful(&recorded.spec, &mut state);
-    all.iter_mut().for_each(|flag| *flag = false);
     let mut state = DeviceState::seeded(&recorded.spec, &recorded.state);
     let only = device.execute_stateful_reading(&recorded.spec, &mut state, &[logits]);
 

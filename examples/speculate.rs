@@ -52,6 +52,18 @@ fn main() {
     });
 
     let ids = qwen35::tokenizer::tokenizer().encode(&prompt);
+    if ids.is_empty() {
+        eprintln!("the prompt encodes to no tokens");
+        std::process::exit(2);
+    }
+    if tokens == 0 {
+        eprintln!("--tokens needs a positive number of decode steps");
+        std::process::exit(2);
+    }
+    if drafts == 0 {
+        eprintln!("--drafts needs at least one proposal");
+        std::process::exit(2);
+    }
     println!("prompt tokens : {}", ids.len());
     println!(
         "workers       : {} at {:?} priority",
@@ -143,7 +155,8 @@ fn main() {
 
     let mut many = Cache::new();
     let _ = model.forward_states(&ids, &mut many, &mut NoTrace);
-    let candidates: Vec<u32> = plain[..=drafts].to_vec();
+    let span = (drafts + 1).min(plain.len());
+    let candidates: Vec<u32> = plain[..span].to_vec();
     let started = std::time::Instant::now();
     let _ = model.forward_states(&candidates, &mut many, &mut NoTrace);
     let batch_ms = 1000.0 * started.elapsed().as_secs_f64();

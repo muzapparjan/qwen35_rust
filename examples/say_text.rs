@@ -41,6 +41,10 @@ fn main() {
     )
     .expect("the conversation renders");
     let mut ids = tokenizer.encode(&rendered);
+    if ids.is_empty() {
+        eprintln!("the prompt encodes to no tokens");
+        std::process::exit(2);
+    }
     println!("prompt tokens: {}", ids.len());
 
     let model = Model::new();
@@ -50,6 +54,7 @@ fn main() {
     println!("prefill: {:.2} s", started.elapsed().as_secs_f64());
 
     let mut produced = Vec::new();
+    let mut streamed = tokenizer.decoder();
     for step in 0..tokens {
         let next = top(&logits);
         // The checkpoint's `generation_config.eos_token_id` is `<|endoftext|>`
@@ -65,7 +70,7 @@ fn main() {
         if step == 0 {
             println!("first token: {:.2} s", started.elapsed().as_secs_f64());
         }
-        print!("{}", tokenizer.decode(&[next]));
+        print!("{}", streamed.feed(next));
         use std::io::Write;
         std::io::stdout().flush().ok();
     }

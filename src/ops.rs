@@ -1932,14 +1932,12 @@ mod tests {
     }
 
     /// Expansion is exact, so the two paths must agree bit for bit — including
-    /// over a buffer long enough to run the sixteen-byte rounds more than once.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn the_neon_expansion_is_bit_exact() {
+    /// over a buffer long enough to run the vector rounds more than once.
+    fn check_expansion_is_bit_exact() {
         let patterns = scales(&[0.0625, 1.5, 0.25, 2.0, 0.5, 0.125, 1.0, 3.0]);
-        // Four-bit: 256 values in eight groups of 32, so 64 bytes and four
+        // Four-bit: 256 values in eight groups of 32, so 128 bytes and eight
         // rounds of sixteen.
-        let integers: Vec<u8> = (0..64u32).map(|index| (index * 37 % 256) as u8).collect();
+        let integers: Vec<u8> = (0..128u32).map(|index| (index * 37 % 256) as u8).collect();
         let mut slow = [0.0f32; 256];
         let mut fast = [0.0f32; 256];
         dequantize_scalar(4, 32, &patterns, &integers, &mut slow);
@@ -1948,8 +1946,8 @@ mod tests {
             assert_eq!(a.to_bits(), b.to_bits(), "four-bit: {a} vs {b}");
         }
 
-        // Eight-bit: two groups of 32 values, 64 bytes of payload.
-        let integers: Vec<u8> = (0..64u32).map(|index| (index * 53 % 256) as u8).collect();
+        // Eight-bit: the same eight groups, one byte per value.
+        let integers: Vec<u8> = (0..256u32).map(|index| (index * 53 % 256) as u8).collect();
         dequantize_scalar(8, 32, &patterns, &integers, &mut slow);
         dequantize(8, 32, &patterns, &integers, &mut fast);
         for (a, b) in slow.iter().zip(&fast) {
@@ -1959,9 +1957,7 @@ mod tests {
 
     /// A reduction has an association order, so the two paths agree to within
     /// the error of summing the same terms in a different order.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn the_neon_dot_matches_the_portable_one() {
+    fn check_dot_matches_the_portable_one() {
         for length in [32usize, 33, 64, 129, 1024] {
             let left: Vec<f32> = (0..length).map(|index| (index as f32 * 0.37).sin()).collect();
             let right: Vec<f32> = (0..length).map(|index| (index as f32 * 0.11).cos()).collect();
@@ -1975,9 +1971,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn the_neon_quantised_dot_matches_the_portable_one() {
+    fn check_quantised_dot_matches_the_portable_one() {
         let columns = 64;
         let group = 32;
         let groups = columns / group;
@@ -1995,9 +1989,7 @@ mod tests {
     /// The batch kernels split a batch into a four-token run and a remainder of
     /// one to three tokens, so a length that is not a multiple of four exercises
     /// both halves of the same call.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn the_neon_slab_kernels_match_the_portable_ones() {
+    fn check_slab_kernels_match_the_portable_ones() {
         let columns = 68; // not a multiple of the four-lane vectors either
         let tokens = 7;
         let stride = columns;
@@ -2050,5 +2042,32 @@ mod tests {
         for index in 0..4 * tokens {
             assert!(close(slow[index], fast[index]), "quad, index {index}");
         }
+    }
+
+    /// The vector kernels of a 64-bit ARM build, against the portable ones.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_neon_kernels_match_the_portable_ones() {
+        check_expansion_is_bit_exact();
+        check_dot_matches_the_portable_one();
+        check_quantised_dot_matches_the_portable_one();
+        check_slab_kernels_match_the_portable_ones();
+    }
+
+    /// The vector kernels of an x86 build, against the portable ones.
+    ///
+    /// A machine without AVX2 and FMA runs the portable kernel on both sides, so
+    /// there is nothing to compare; the guard names that instead of passing
+    /// silently as if the wide kernels had been checked.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn the_avx2_kernels_match_the_portable_ones() {
+        if !crate::cpu::features().avx2_fma {
+            return;
+        }
+        check_expansion_is_bit_exact();
+        check_dot_matches_the_portable_one();
+        check_quantised_dot_matches_the_portable_one();
+        check_slab_kernels_match_the_portable_ones();
     }
 }

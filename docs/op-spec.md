@@ -644,9 +644,7 @@ M4 额外要求 `text.norm` 输出与最后位置的 logits top-1。
 
 | 条目 | 由谁 / 用什么读数钉住 |
 |---|---|
-| 图像预处理（`smart_resize` 取整与重采样） | M6 前读 `Qwen2VLImageProcessorFast`，并以 `processor` dump 的 `pixel_values` 对拍 |
-| 视觉塔数值 | M6 的 `patch_embed → 12 层 → merger` 逐点对拍 |
-| MTP 的数学（拼接顺序、norm 类型、embedding/head 是否共享） | M7 前构造模块 + dump |
+| MTP 的数学（拼接顺序、norm 类型、embedding/head 是否共享） | 接线取自 §10 的 vLLM 源；数值对拍需要自建 `mtp` dump |
 | 分块 delta rule 是否值得做 | M9：先量递推形式的 prefill 吞吐，再决定；任何分块实现必须落在 M5 的容差里 |
 | int4 GEMM 的 tile 形状与累加顺序 | M9；判据是 M1/M4 的相对容差不变，且峰值内存不随 `S` 增长 |
 

@@ -121,10 +121,11 @@ fn decomposition(codepoint: u32) -> Option<&'static [u32]> {
                 let offset = u32_at(bytes, base + 4) as usize;
                 let length = u32_at(bytes, base + 8) as usize;
                 let start = tables::POOL + 4 * offset;
-                // SAFETY: the pool section starts on a 64-byte boundary of an
-                // aligned buffer and every entry is a whole number of `u32`, so
-                // the pointer is aligned; the generator checked `length` against
-                // the pool's own length when it wrote the file.
+                // SAFETY: the pool begins at a multiple of four bytes within a
+                // 64-byte-aligned buffer, and every entry is a whole number of
+                // `u32`, so the pointer is at least four-byte aligned; the
+                // generator checked `length` against the pool's own length when it
+                // wrote the file.
                 return Some(unsafe {
                     std::slice::from_raw_parts(bytes[start..].as_ptr().cast::<u32>(), length)
                 });

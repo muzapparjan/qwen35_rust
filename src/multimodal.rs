@@ -28,6 +28,8 @@ pub enum Error {
     },
     /// The tower's output does not match the grid.
     RowCount { expected: usize, actual: usize },
+    /// The prompt holds no tokens, so there is no position to predict from.
+    EmptyPrompt,
 }
 
 impl std::fmt::Display for Error {
@@ -47,6 +49,7 @@ impl std::fmt::Display for Error {
             Error::RowCount { expected, actual } => {
                 write!(formatter, "{actual} merged rows for a grid that needs {expected}")
             }
+            Error::EmptyPrompt => write!(formatter, "a prompt needs at least one token"),
         }
     }
 }
@@ -95,6 +98,9 @@ fn image_runs(ids: &[u32]) -> Vec<(usize, usize)> {
 /// The offset is what the reference adds to `past + index` when it generates the
 /// next token: the prompt's largest position plus one, minus the prompt's length.
 pub fn positions(ids: &[u32], images: &[vision::Grid]) -> Result<(Vec<[u32; 3]>, i64), Error> {
+    if ids.is_empty() {
+        return Err(Error::EmptyPrompt);
+    }
     let runs = image_runs(ids);
     if runs.len() != images.len() {
         return Err(Error::ImageCount {
@@ -195,7 +201,7 @@ pub fn embeddings(ids: &[u32], images: &[Image<'_>]) -> Result<(Vec<f32>, i64), 
         );
     }
     let runs = image_runs(ids);
-    for ((start, length), image) in runs.iter().zip(images) {
+    for ((start, _length), image) in runs.iter().zip(images) {
         let expected = merged_tokens(&image.grid);
         if image.values.len() != expected * hidden {
             return Err(Error::RowCount {
@@ -203,7 +209,6 @@ pub fn embeddings(ids: &[u32], images: &[Image<'_>]) -> Result<(Vec<f32>, i64), 
                 actual: image.values.len(),
             });
         }
-        let _ = length;
         let target = &mut out[*start * hidden..(*start + expected) * hidden];
         target.copy_from_slice(image.values);
     }
@@ -214,9 +219,10 @@ impl Model {
     /// Run a prompt that may contain images and return the logits of its last
     /// position.
     ///
-    /// The cache learns the position offset the image's grid implies, so later
-    /// single-token calls continue from the right place without the caller having
-    /// to remember anything.
+    /// The prompt continues from whatever the cache already holds, and the cache
+    /// learns the position offset the image's grid implies, so later single-token
+    /// calls continue from the right place without the caller having to remember
+    /// anything.
     pub fn forward_prompt<T: Trace>(
         &self,
         ids: &[u32],
@@ -224,10 +230,29 @@ impl Model {
         cache: &mut Cache,
         trace: &mut T,
     ) -> Result<Vec<f32>, Error> {
-        let (embeds, delta) = embeddings(ids, images)?;
+        let (embeds, _) = embeddings(ids, images)?;
         let grids: Vec<vision::Grid> = images.iter().map(|image| image.grid).collect();
-        let (positions, _) = positions(ids, &grids)?;
-        cache.position_delta = delta;
+        let (local, _) = positions(ids, &grids)?;
+        // The prompt starts where the cache ends, the same way `forward` does.
+        let base = cache.length as i64 + cache.position_delta;
+        let base = base.max(0) as u32;
+        let positions: Vec<[u32; 3]> = local
+            .iter()
+            .map(|position| {
+                [
+                    position[0] + base,
+                    position[1] + base,
+                    position[2] + base,
+                ]
+            })
+            .collect();
+        let largest = positions
+            .iter()
+            .flat_map(|position| position.iter().copied())
+            .max()
+            .unwrap_or(base);
+        let after = cache.length + ids.len();
+        cache.position_delta = i64::from(largest) + 1 - after as i64;
         Ok(self.forward_embeds(&embeds, ids.len(), &positions, cache, trace))
     }
 }

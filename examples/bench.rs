@@ -45,6 +45,18 @@ fn main() {
     }
 
     let ids = tokenizer().encode(&prompt);
+    if ids.is_empty() {
+        eprintln!("the prompt encodes to no tokens");
+        std::process::exit(2);
+    }
+    if tokens == 0 {
+        eprintln!("--tokens needs a positive number of decode steps");
+        std::process::exit(2);
+    }
+    if repeats == 0 {
+        eprintln!("--repeats needs a positive number of runs");
+        std::process::exit(2);
+    }
     println!("prompt tokens : {}", ids.len());
     println!("workers       : {}", parallel::threads());
 
@@ -68,8 +80,13 @@ fn main() {
             per_token.push(started.elapsed().as_secs_f64());
         }
         per_token.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-        // The first token also writes the caches' first entries; drop it.
-        let kept = &per_token[1.min(per_token.len() - 1)..];
+        // The first token also writes the caches' first entries; drop it when
+        // there is a later one to measure instead.
+        let kept = if per_token.len() > 1 {
+            &per_token[1..]
+        } else {
+            &per_token[..]
+        };
         decodes.push(kept[kept.len() / 2]);
     }
     prefills.sort_by(|a, b| a.partial_cmp(b).expect("finite"));

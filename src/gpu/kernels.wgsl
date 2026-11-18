@@ -26,9 +26,8 @@ struct Parameters {
     eps: f32,
     // A kernel's second width: the rotary length, a head's width, or a stride.
     extra: u32,
-    // How the host sized the dispatch: 0 elementwise, 1 one workgroup per row,
-    // 2 one per head, 3 one workgroup in total. The shaders do not read it; it is
-    // here so the host and the shader agree on the block's layout.
+    // Reserved: neither side reads it, and both keep it so the block's layout is
+    // the same in the shader and on the host.
     kind: u32,
     // A grouped copy's outer stride and band offset.
     stride: u32,
@@ -56,6 +55,19 @@ fn sigmoid(value: f32) -> f32 {
 fn softplus(value: f32) -> f32 {
     // `log(1 + exp(x))`, written so a large x does not overflow the exponential.
     return max(value, 0.0) + log(1.0 + exp(-abs(value)));
+}
+
+// A dispatch dimension counts workgroups, and a device caps it at 65535. The host
+// puts the overflow in the second dimension, whose workgroups repeat the first
+// dimension's indices; `num_workgroups.x` is that repeat count, so an index in a
+// two-dimensional dispatch is still dense.
+fn flat_index(id: vec3<u32>, groups: vec3<u32>, threads: u32) -> u32 {
+    return id.x + id.y * groups.x * threads;
+}
+
+// The workgroup a thread belongs to, when a workgroup owns one row.
+fn block_index(id: vec3<u32>, groups: vec3<u32>, threads: u32) -> u32 {
+    return id.x / threads + id.y * groups.x;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,8 +107,11 @@ fn scale_at(index: u32) -> f32 {
 // One invocation per output element. Nothing is reduced, so the result is exact
 // and matches the CPU path bit for bit.
 @compute @workgroup_size(64)
-fn dequantize_one(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn dequantize_one(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let total = quant_parameters.rows * quant_parameters.columns;
     if index >= total {
         return;
@@ -109,8 +124,11 @@ fn dequantize_one(@builtin(global_invocation_id) id: vec3<u32>) {
 //
 // `quant_input` holds one id per row, `quant_output` receives `rows x columns`.
 @compute @workgroup_size(64)
-fn embed_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn embed_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= quant_parameters.rows * quant_parameters.columns {
         return;
     }
@@ -460,8 +478,11 @@ fn reduce_sums(lane: u32) {
 
 // `out[i] = a[i] * f[0]`.
 @compute @workgroup_size(64)
-fn scale_all(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn scale_all(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= parameters.rows * parameters.columns {
         return;
     }
@@ -470,8 +491,11 @@ fn scale_all(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // `out[i] = a[i] + b[i]`.
 @compute @workgroup_size(64)
-fn add_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn add_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= parameters.rows * parameters.columns {
         return;
     }
@@ -480,8 +504,11 @@ fn add_rows(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // `out[i] = a[i] * sigmoid(b[i])`.
 @compute @workgroup_size(64)
-fn gate_mul(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn gate_mul(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= parameters.rows * parameters.columns {
         return;
     }
@@ -490,8 +517,11 @@ fn gate_mul(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // `out[i] = silu(a[i]) * b[i]`.
 @compute @workgroup_size(64)
-fn silu_mul_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn silu_mul_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= parameters.rows * parameters.columns {
         return;
     }
@@ -501,8 +531,11 @@ fn silu_mul_rows(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // Split every `2 * extra` row of `a` into its first and second halves.
 @compute @workgroup_size(64)
-fn split_bands(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn split_bands(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let width = parameters.extra;
     if index >= parameters.rows * width {
         return;
@@ -518,8 +551,11 @@ fn split_bands(@builtin(global_invocation_id) id: vec3<u32>) {
 // `stride` is the outer stride and `offset` the band's first element, so
 // `out[row][i] = a[(row / group) * stride + offset + (row % group) * columns + i]`.
 @compute @workgroup_size(64)
-fn gather_bands(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn gather_bands(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let width = parameters.columns;
     if index >= parameters.rows * width {
         return;
@@ -537,11 +573,12 @@ fn gather_bands(@builtin(global_invocation_id) id: vec3<u32>) {
 fn rms_norm_rows(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(local_invocation_id) lane: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
 ) {
     // One workgroup owns one row, so the row comes from the group index and every
     // thread of the group works on the same row. Every thread has to reach the
     // barriers below, so the guard tests the row before any of them.
-    let row = id.x / ROW_THREADS;
+    let row = block_index(id, groups, ROW_THREADS);
     if row >= parameters.rows {
         return;
     }
@@ -566,8 +603,9 @@ fn rms_norm_rows(
 fn gated_rms_norm_rows(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(local_invocation_id) lane: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let row = id.x / ROW_THREADS;
+    let row = block_index(id, groups, ROW_THREADS);
     if row >= parameters.rows {
         return;
     }
@@ -588,13 +626,14 @@ fn gated_rms_norm_rows(
     }
 }
 
-// `out = (a - mean) / sqrt(variance + eps) * (1 + f) + g` over each row.
+// `out = (a - mean) / sqrt(variance + eps) * f + g` over each row.
 @compute @workgroup_size(128)
 fn layer_norm_rows(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(local_invocation_id) lane: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let row = id.x / ROW_THREADS;
+    let row = block_index(id, groups, ROW_THREADS);
     if row >= parameters.rows {
         return;
     }
@@ -620,7 +659,7 @@ fn layer_norm_rows(
     let inverse = 1.0 / sqrt(wide_sums[0] / f32(width) + parameters.eps);
     workgroupBarrier();
     for (var index = lane.x; index < width; index = index + ROW_THREADS) {
-        out[base + index] = (a[base + index] - mean) * inverse * (1.0 + f[index]) + g[index];
+        out[base + index] = (a[base + index] - mean) * inverse * f[index] + g[index];
     }
 }
 
@@ -628,8 +667,11 @@ fn layer_norm_rows(
 //
 // A token index is below 2^24, so it is exact as `f32`.
 @compute @workgroup_size(32)
-fn argmax_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let row = id.x / 32u;
+fn argmax_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let row = block_index(id, groups, 32u);
     if row >= parameters.rows {
         return;
     }
@@ -651,8 +693,9 @@ fn argmax_rows(@builtin(global_invocation_id) id: vec3<u32>) {
 fn softmax_rows(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(local_invocation_id) lane: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let row = id.x / ROW_THREADS;
+    let row = block_index(id, groups, ROW_THREADS);
     if row >= parameters.rows {
         return;
     }
@@ -686,8 +729,9 @@ fn softmax_rows(
 fn l2_normalize_rows(
     @builtin(global_invocation_id) id: vec3<u32>,
     @builtin(local_invocation_id) lane: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
 ) {
-    let row = id.x / ROW_THREADS;
+    let row = block_index(id, groups, ROW_THREADS);
     if row >= parameters.rows {
         return;
     }
@@ -710,8 +754,11 @@ fn l2_normalize_rows(
 // `rotate_half` with the pairing `(i, i + half)` over the first `extra` values of
 // each row. `f` and `g` hold the angles, `extra / 2` per row.
 @compute @workgroup_size(64)
-fn rope_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn rope_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let total = parameters.rows * parameters.columns;
     if index >= total {
         return;
@@ -767,8 +814,11 @@ fn sum_all(
 // not touch it: the pass emits `convolve_carry` afterwards, so no invocation reads
 // a window another one has already moved.
 @compute @workgroup_size(64)
-fn convolve_rows(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn convolve_rows(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let channels = parameters.columns;
     let tokens = parameters.rows;
     let taps = parameters.taps;
@@ -795,8 +845,11 @@ fn convolve_rows(@builtin(global_invocation_id) id: vec3<u32>) {
 //
 // One invocation per channel, so no two invocations write the same window slot.
 @compute @workgroup_size(64)
-fn convolve_carry(@builtin(global_invocation_id) id: vec3<u32>) {
-    let channel = id.x;
+fn convolve_carry(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let channel = flat_index(id, groups, 64u);
     let channels = parameters.columns;
     let tokens = parameters.rows;
     let taps = parameters.taps;
@@ -822,8 +875,11 @@ fn convolve_carry(@builtin(global_invocation_id) id: vec3<u32>) {
 // `a` holds the raw `b` increments, `f` the `A_log` vector and `g` the `dt_bias`
 // vector. One invocation per `(token, head)`.
 @compute @workgroup_size(64)
-fn gate_decay(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn gate_decay(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let rows = parameters.rows;
     if index >= rows {
         return;
@@ -840,8 +896,11 @@ fn gate_decay(@builtin(global_invocation_id) id: vec3<u32>) {
 // are the caches at `[past + token][head][width]`. Both caches are writable operands,
 // so one dispatch fills both.
 @compute @workgroup_size(64)
-fn kv_append(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn kv_append(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     let width = parameters.columns;
     let heads = parameters.extra;
     let tokens = parameters.rows;
@@ -905,18 +964,22 @@ fn attention_scores(
     let position = (group % parameters.groups) * SCORES_PER_GROUP + warp;
     let token = row / parameters.heads;
     let head = row % parameters.heads;
-    // The tail of a row is past the token's causal prefix. Every lane of the warp
-    // takes this branch together, so the barriers below are not split.
-    if position >= parameters.past + token + 1u {
-        return;
-    }
     let kv_head = head / (parameters.heads / parameters.kv_heads);
     let query = row * width;
-    let other = (position * parameters.kv_heads + kv_head) * width;
+    // The tail of a row is past the token's causal prefix. A workgroup holds four
+    // scores and its threads reduce together, so a warp whose score is past the
+    // end cannot leave: it reads the last visible position, contributes a zero
+    // partial, and takes every barrier with the rest, storing nothing.
+    let visible = parameters.past + token + 1u;
+    let live = position < visible;
+    let reading = min(position, visible - 1u);
+    let other = (reading * parameters.kv_heads + kv_head) * width;
 
     var sum = 0.0;
-    for (var column = lane_in_warp; column < width; column = column + 32u) {
-        sum = sum + a[query + column] * d[other + column];
+    if live {
+        for (var column = lane_in_warp; column < width; column = column + 32u) {
+            sum = sum + a[query + column] * d[other + column];
+        }
     }
     // One warp's worth of the shared array, so the group's scores reduce side by side.
     let base = warp * 32u;
@@ -934,7 +997,7 @@ fn attention_scores(
         workgroupBarrier();
         width_step = width_step / 2u;
     }
-    if lane_in_warp == 0u {
+    if lane_in_warp == 0u && live {
         e[row * stride + position] = score_partials[base] / sqrt(f32(width));
     }
 }
@@ -942,8 +1005,11 @@ fn attention_scores(
 // Turn each row of scores into weights: subtract the row's largest, exponentiate,
 // divide by the total.
 @compute @workgroup_size(64)
-fn attention_softmax(@builtin(global_invocation_id) id: vec3<u32>) {
-    let index = id.x;
+fn attention_softmax(
+    @builtin(global_invocation_id) id: vec3<u32>,
+    @builtin(num_workgroups) groups: vec3<u32>,
+) {
+    let index = flat_index(id, groups, 64u);
     if index >= parameters.rows {
         return;
     }

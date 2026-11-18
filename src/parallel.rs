@@ -343,9 +343,9 @@ pub struct Budget {
 /// - macOS: `PRIO_DARWIN_BG` on the thread.
 ///
 /// Every one of those is reversible without a privilege, so a host that asks
-/// for [`Priority::Normal`] again gets the cores back. A target with none of
-/// those mechanisms keeps its threads where the process put them; the pool
-/// reports that through [`budget`] rather than pretending the change landed.
+/// for [`Priority::Normal`] again gets the cores back. On a target with none of
+/// those mechanisms the workers keep whatever priority the process gave them,
+/// and the request stays recorded in [`budget`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Priority {
     /// Below every normal thread: the operating system preempts a worker the
@@ -397,9 +397,9 @@ static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
 /// caller believing the machine is quieter than it is. Changing the count after
 /// the pool exists is therefore a programming error and panics.
 pub fn set_budget(budget: Budget) {
-    if let Some(pool) = POOL.get()
-        && budget.threads > 0
-    {
+    if let Some(pool) = POOL.get() {
+        // Both fields decide the count, so both are checked: a budget that only
+        // changes `reserve` asks for a different count just as plainly.
         let count = budget.workers(available_cores());
         assert_eq!(
             count,
@@ -414,9 +414,15 @@ pub fn set_budget(budget: Budget) {
 
 /// The budget in force.
 ///
-/// Reading it does not create the pool.
+/// Reading it does not create the pool. Once the pool exists the thread count here
+/// is the one it runs, not the one that was asked for.
 pub fn budget() -> Budget {
-    *BUDGET.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    let mut budget = *BUDGET.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(pool) = POOL.get() {
+        budget.threads = pool.threads();
+        budget.reserve = 0;
+    }
+    budget
 }
 
 /// Run the workers at `priority` from now on.

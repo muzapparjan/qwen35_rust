@@ -84,6 +84,16 @@ pub struct Device {
     /// second, kept between calls because a decode loop needs one the size of the
     /// cache every step.
     attention: Mutex<Option<(wgpu::Buffer, usize)>>,
+    /// Held for the whole of a pass. The arena, the parameter slab and the staging
+    /// buffer are shared, so two calls at once would lease the same buffers and
+    /// map the same staging buffer twice; the device is `Sync`, so the guard is
+    /// what keeps that from happening.
+    pass: Mutex<()>,
+    /// One-float factors that `Scale` and `L2Normalize` multiply by, one buffer per
+    /// dispatch of the current pass. A pass stages every write before it submits,
+    /// so two dispatches cannot share a factor buffer; the count is reset at the
+    /// start of each pass and the buffers are kept for the next one.
+    factors: Mutex<(Vec<wgpu::Buffer>, usize)>,
 }
 
 /// A bound vector's buffer and the values it holds.
@@ -408,6 +418,8 @@ impl Device {
             staging: Mutex::new(None),
             spares: Mutex::new(None),
             attention: Mutex::new(None),
+            pass: Mutex::new(()),
+            factors: Mutex::new((Vec::new(), 0)),
         })
     }
 
@@ -487,6 +499,10 @@ impl Device {
         outputs: &[usize],
     ) -> Arena {
         let device = &self.device;
+        // One pass at a time: the buffers below are shared with every other call.
+        let _pass = self.pass.lock().expect("one pass per device at a time");
+        // The factor pool is indexed by dispatch within a pass.
+        self.factors.lock().expect("factors").1 = 0;
         // Every operand is resolved before the encoder is opened: a tensor that is
         // not uploaded yet costs an upload, and that must not happen in the middle
         // of recording the pass.
@@ -730,14 +746,16 @@ impl Device {
         drop(pipelines);
 
         // One staging buffer for the slots this call wants, one copy each, one
-        // mapping.
+        // mapping. A slot that holds nothing has nothing to copy, and the copy and
+        // the read-back must agree on that: padding one side only would shift every
+        // slot after it.
         let arena_sizes: Vec<u64> = spec
             .buffers
             .iter()
             .enumerate()
             .map(|(index, length)| {
                 if wanted[index] {
-                    (*length * 4).max(4) as u64
+                    (*length * 4) as u64
                 } else {
                     0
                 }
@@ -999,6 +1017,10 @@ const MATVEC_WARPS: usize = 4;
 /// same number as `SCORES_PER_GROUP`.
 const SCORES_PER_GROUP: usize = 4;
 
+/// Tokens one matvec workgroup multiplies at once. `kernels.wgsl` declares the
+/// same number as `TOKEN_CHUNK`; a disagreement mis-addresses the token offsets.
+const TOKEN_CHUNK: usize = 8;
+
 impl Device {
     /// Record one kernel into the pass' command buffer.
     #[allow(clippy::too_many_arguments)]
@@ -1091,8 +1113,8 @@ impl Device {
                 out,
             } => {
                 parameters.tokens = tokens as u32;
-                // One workgroup per `(weight row group, chunk of eight tokens)`.
-                let chunks = tokens.div_ceil(8);
+                // One workgroup per `(weight row group, chunk of tokens)`.
+                let chunks = tokens.div_ceil(TOKEN_CHUNK);
                 parameters.grid_x = 0;
                 match weight {
                     Weight::Tensor(name) if crate::weights::expect(name).matrix().kind != "q4" => {
@@ -1312,7 +1334,7 @@ impl Device {
                 factor,
                 out,
             } => {
-                let scale = upload_f32(&self.device, &self.queue, "factor", &[factor]);
+                let scale = self.factor(factor);
                 parameters.rows = length(out) as u32;
                 self.step(
                     encoder,
@@ -1451,7 +1473,7 @@ impl Device {
                 scale,
                 out,
             } => {
-                let factor = upload_f32(&self.device, &self.queue, "scale", &[scale]);
+                let factor = self.factor(scale);
                 parameters.rows = rows as u32;
                 parameters.columns = width as u32;
                 parameters.eps = eps;
@@ -1482,6 +1504,12 @@ impl Device {
                 rotary,
                 out,
             } => {
+                assert_eq!(
+                    length(cos),
+                    rows * (rotary / 2),
+                    "the rope table holds one angle row per position"
+                );
+                assert_eq!(length(cos), length(sin), "one sine row per cosine row");
                 parameters.rows = rows as u32;
                 parameters.columns = width as u32;
                 parameters.extra = rotary as u32;
@@ -1949,6 +1977,25 @@ fn upload_f32(
 }
 
 impl Device {
+    /// A one-float operand holding `value`, distinct from every other factor this
+    /// pass handed out.
+    fn factor(&self, value: f32) -> wgpu::Buffer {
+        let mut cached = self.factors.lock().expect("factors");
+        let (buffers, used) = &mut *cached;
+        if *used == buffers.len() {
+            buffers.push(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("factor"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let buffer = buffers[*used].clone();
+        *used += 1;
+        self.queue.write_buffer(&buffer, 0, &value.to_le_bytes());
+        buffer
+    }
+
     /// A dense weight as `f32`, uploaded the first time it is asked for.
     fn dense_tensor(&self, name: &str) -> wgpu::Buffer {
         let mut dense = self.dense.lock().expect("dense tensors");

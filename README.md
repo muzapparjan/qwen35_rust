@@ -20,8 +20,8 @@ GPU 后端在后面的里程碑里以 feature 引入。
 | M4 | 24 层 + final norm + 输出头 | **已交付** | 24 层逐层 residual 对拍（3 个用例），logits top-1 全中 |
 | M5 | prefill / decode cache 一致性 | **已交付** | 两条路径（批量分块内核与单 token 融合内核）相对差 4.0e-7，top-1 相同；批量内任意切分逐位相同 |
 | M6 | 视觉塔 + 图像输入 | **已交付** | 预处理 `max\|d\|` 5.9e-8 / 一个灰度级；塔相对误差 1.0e-5 / 9.4e-6；图像 prompt 的 logits 2.5e-6 / 2.5e-4，top-1 与参考相同；图像之后走一步 1.8e-6 / 3.0e-4；贪心生成前 10 个 token 与参考逐字相同 |
-| M7 | MTP 头 | 待做 | 与自建 dump 对拍（PyTorch 主类不加载它） |
-| M8 | wgpu 后端 | 待做 | 与 CPU 后端同算术路径结果一致（`--features wgpu`） |
+| M7 | MTP 头 | **已交付** | 草稿头在 `src/model/mtp.rs`；`tests/speculation.rs` 判据：投机生成的 token 与贪心逐 token 相同，拒绝后的主缓存与没跑过一样 |
+| M8 | wgpu 后端 | **已交付** | `tests/gpu_model.rs` 三条判据：整趟前向相对误差 < 1e-3 且 argmax 相同、跨步状态一致、共享/独占 arena 的 logits 相同 |
 | M9 | 性能 | **已交付**：prefill 0.333 s ＝ 243 tok/s、decode 0.020 s/token（同窗口基线 0.422 s ＝ 192 tok/s、0.113 s/token，即 prefill 1.27 倍、decode 5.6 倍） | 超过 PyTorch eager 基线（两实现交替测量；这台机器有常驻负载，不同窗口的绝对值不可比） |
 
 每个数字的出处（命令与日期）在 [`dev/README.md`](dev/README.md)：那里只写实测
@@ -85,8 +85,9 @@ cargo test --features reference-fixtures
 | 其它（含 32 位 ARM） | 标量 | 1 |
 
 AVX2 与 FMA3 是 x86-64 的公共扩展，不是某一家的指令；NEON 在 ARMv8-A 里是必备项，所以
-64 位 ARM 不需要运行时检测。两个内核都由 `ops` 的单元测试与标量路径对拍（展开逐位相等，
-点积在求和次序的误差内），这些测试在任何平台上构建时都会跑。
+64 位 ARM 不需要运行时检测。两套向量内核都由 `ops` 的单元测试与可移植路径对拍（展开逐位
+相等，点积在求和次序的误差内）：ARM 的那组在 `aarch64` 构建里跑，x86 的那组在带 AVX2+FMA
+的机器上跑。
 
 生成是 fork-join 负载，会把给它的核全部用满。库因此收一个 [`parallel::Budget`]，而不是
 自己决定：
@@ -113,8 +114,8 @@ cargo run --release --features wgpu --example gpu_bench
 cargo test  --features wgpu --test gpu
 ```
 
-两个内核目前搬到了设备上：q4 展开与 q4 矩阵-向量乘。判据按结果种类分开，因为在 WGSL 里
-**归约的结合次序与乘加是否融合由实现决定**：
+设备执行器实现全部 21 个算子：`Flow` 记录的整趟前向一次录完、分块提交、回读一次。判据按
+结果种类分开，因为在 WGSL 里**归约的结合次序与乘加是否融合由实现决定**：
 
 | 内核 | 判据 | 实测（RTX 4090 / Vulkan） |
 |---|---|---|

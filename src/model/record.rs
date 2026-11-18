@@ -28,6 +28,10 @@ pub struct Recorded {
     /// The arena index of the logits.
     pub logits: Slot,
     /// The arena index of the last position's hidden state.
+    ///
+    /// It is populated by [`Model::execute`], which runs the whole arena; the
+    /// [`execute_recorded`] path asks for the logits only, so an arena from there
+    /// does not hold this slot's value.
     pub hidden: Slot,
 }
 
@@ -106,6 +110,16 @@ impl Model {
     ) -> Recorded {
         let hidden = manifest::HIDDEN_SIZE;
         let eps = manifest::RMS_NORM_EPS;
+        assert!(sequence > 0, "a recorded pass needs at least one token");
+        assert_eq!(ids.len(), sequence, "one id per token");
+        assert_eq!(positions.len(), sequence, "one position per token");
+        if let Some(state) = state {
+            assert_eq!(
+                state.len(),
+                2 * (manifest::FULL_LAYERS.len() + manifest::LINEAR_LAYERS.len()),
+                "one state buffer per caller-owned state"
+            );
+        }
         let mut flow = Flow::new();
 
         // --- the caller's state, in a fixed order. Its buffers are declared by
@@ -182,7 +196,6 @@ impl Model {
                 self.record_linear_attention(
                     &mut flow,
                     &base,
-                    slot,
                     &linear_slots[slot],
                     normalized,
                     sequence,
@@ -322,7 +335,6 @@ impl Model {
         &self,
         flow: &mut Flow,
         base: &str,
-        _slot: usize,
         state_slots: &(Slot, Slot),
         x: Slot,
         sequence: usize,

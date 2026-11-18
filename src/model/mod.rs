@@ -139,12 +139,12 @@ impl Cache {
     }
 
     /// Put the recurrent state back the way the snapshot found it, and keep the
-    /// first `drafts` entries of the draft head's cache.
+    /// first `draft_entries` entries of the draft head's cache.
     ///
     /// The attention lengths go back to the snapshot's, because the caller walks
     /// the kept prefix again and that walk advances them; only the draft head's
     /// cache is not walked, so its length is set directly.
-    pub fn rollback(&mut self, snapshot: &Snapshot, drafts: usize) {
+    pub fn rollback(&mut self, snapshot: &Snapshot, draft_entries: usize) {
         assert!(
             snapshot.length <= self.length,
             "a rollback cannot lengthen the cache"
@@ -154,7 +154,7 @@ impl Cache {
         for cache in self.attention.iter_mut() {
             cache.positions = snapshot.length;
         }
-        self.mtp.positions = snapshot.draft_positions + drafts;
+        self.mtp.positions = snapshot.draft_positions + draft_entries;
     }
 }
 
@@ -332,6 +332,13 @@ impl Model {
     ) -> Outputs {
         let hidden = manifest::HIDDEN_SIZE;
         let eps = manifest::RMS_NORM_EPS;
+        assert!(sequence > 0, "a forward pass needs at least one token");
+        assert_eq!(
+            x.len(),
+            sequence * hidden,
+            "one embedding row per token"
+        );
+        assert_eq!(positions.len(), sequence, "one position per token");
         record!(trace, &[sequence, hidden], &x, "embed");
 
         // --- layers

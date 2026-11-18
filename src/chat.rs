@@ -159,9 +159,14 @@ pub fn render(messages: &[Message], options: &Options) -> Result<String, Error> 
             }
             Role::Assistant => {
                 output.push_str("<|im_start|>assistant\n");
-                if index > last_query {
+                // The block is part of the turn only where a turn carries reasoning.
+                // A message that carries none renders as its answer alone; an empty
+                // reasoning string is written as the empty block it is.
+                if index > last_query
+                    && let Some(reasoning) = message.reasoning
+                {
                     output.push_str("<think>\n");
-                    output.push_str(message.reasoning.unwrap_or("").trim());
+                    output.push_str(reasoning.trim());
                     output.push_str("\n</think>\n\n");
                 }
                 output.push_str(message.content.trim());
@@ -262,6 +267,20 @@ mod tests {
             rendered,
             "<|im_start|>user\nExplain.<|im_end|>\n\
              <|im_start|>assistant\n<think>\n2+2 = 4\n</think>\n\nIt is four.<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn an_answer_without_reasoning_has_no_thinking_block() {
+        let rendered = render_default(&[
+            Message::user("Explain."),
+            Message::assistant("It is four."),
+        ]);
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nExplain.<|im_end|>\n\
+             <|im_start|>assistant\nIt is four.<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
     }

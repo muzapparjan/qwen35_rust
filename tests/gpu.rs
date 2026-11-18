@@ -190,13 +190,6 @@ fn a_recorded_pass_reaches_the_device_whole() {
         1000.0 * portable_seconds,
         worst
     );
-    println!(
-        "mlp pass: {} operators, {} tensors; portable {:.2} ms; worst {:.1e}",
-        spec.ops.len(),
-        spec.tensors.len(),
-        1000.0 * portable_seconds,
-        worst
-    );
 }
 
 /// The arena index a slot names.
