@@ -6,3 +6,6 @@
 !/dev/README.md
 # A library: the resolver is the consumer's choice.
 /Cargo.lock
+# The container is a 494,845,446 byte release asset, not a tracked file:
+# scripts/fetch-weights.ps1 downloads it into src/weights/ and verifies it.
+/src/weights/*.qwqt

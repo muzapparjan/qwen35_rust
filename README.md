@@ -4,7 +4,8 @@ Qwen3.5-0.8B 的 Rust 推理库。默认构建是 **CPU 路径、零第三方依
 `wgpu` feature 加上设备后端，跑同一套算术。
 
 权重是一份 QWQT 量化容器（4-bit 分组量化，494,845,446 B），**编译期嵌入**，
-运行时不做任何文件 IO。
+运行时不做任何文件 IO。容器本身是 release asset，不在仓库里：第一次构建前先跑
+`scripts/fetch-weights.ps1` 把它取到 `src/weights/` 并校验。
 
 算子级的规格（每个算子的作用轴、来自参考实现的哪一行）在
 [`docs/op-spec.md`](docs/op-spec.md)。
@@ -25,6 +26,7 @@ Qwen3.5-0.8B 的 Rust 推理库。默认构建是 **CPU 路径、零第三方依
 ## 快速开始
 
 ```
+scripts\fetch-weights.ps1
 cargo run --release --example say_text -- "用一句话介绍你自己。"
 cargo run --release --example bench -- --prompt hello --tokens 32
 ```
@@ -59,7 +61,7 @@ src/gpu/mod.rs          设备执行器与 WGSL 流水线
 src/gpu/kernels.wgsl    算子的设备实现（WGSL）
 src/weights/mod.rs      嵌入的容器、张量查找、dense 张量的 f32 视图
 src/weights/manifest.rs @generated：488 个张量的名字/形状/偏移 + 架构常量
-src/weights/qwen3.5-0.8b-q4.qwqt  嵌入的权重（494.8 MB，-text）
+src/weights/qwen3.5-0.8b-q4.qwqt  嵌入的权重（494.8 MB，由 scripts/fetch-weights.ps1 取得）
 src/tokenizer/          byte-level BPE、NFC、预分词、增量解码
 src/chat.rs             文本对话模板
 src/vision/             图像预处理（缩放、patch 化）与 12 层视觉塔
@@ -185,6 +187,10 @@ slot 叠到同一块存储上，回读点名的 slot 不共享存储。
 | `src/tokenizer/data/tokenizer.bin` | 5,808,391 | 词表、merges、added tokens |
 | `src/tokenizer/data/unicode.bin` | 83,104 | 字符类、组合类、NFC 表 |
 
+权重容器不在仓库里，由 `scripts/fetch-weights.ps1` 从 release asset 下载，按字节数与
+SHA256 校验后落到 `src/weights/`。缺它时 `build.rs` 直接让构建失败，而不是让
+`include_bytes!` 报一句只带路径的错。
+
 `manifest.rs` 里的 `offset` 是**相对嵌入文件**的绝对字节偏移，`weights::blob()[offset..]`
 就是该张量的第一个字节。manifest 由容器自己的 header 生成，所以文件换一份而 manifest
 没重生成时，`Aligned<FILE_LEN>` 的长度不匹配会直接让编译失败。
@@ -196,7 +202,7 @@ slot 叠到同一块存储上，回读点名的 slot 不共享存储。
 
 本仓的代码是 **Apache-2.0**，见 [`LICENSE`](LICENSE)。
 
-它**分发**三份衍生数据（它们嵌在仓库里，不是运行时读的外部文件），义务因此不止是「引用」：
+它**分发**三份衍生数据（它们随本项目分发，不是运行时读的外部文件），义务因此不止是「引用」：
 
 | 文件 | 上游 | 与上游的关系 |
 |---|---|---|
