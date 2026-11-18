@@ -1,6 +1,6 @@
 [package]
 name = "qwen35-rust"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 # The default build needs 1.85 (edition 2024). The `wgpu` feature raises it to
 # 1.87, which is what wgpu, wgpu-core, wgpu-hal and naga each declare, and Cargo
